@@ -3,7 +3,7 @@ pages/3_chat_reports.py
 
 Ask natural language questions about past analysis reports.
 ChromaDB retrieves relevant chunks; the chat LLM (routed through
-litellm + OPENROUTER_API_KEY, OpenRouter-specific — separate from
+litellm + OPENAI_API_KEY, OPENAI-specific — separate from
 the Gemini routing used by agents.py / data_cleaner.py / domain_detector.py
 / dashboard_agent.py) answers from them.
 """
@@ -88,7 +88,7 @@ def _llm_completion_with_retry(model, messages, max_tokens=1200, temperature=0.3
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
-                api_key=os.getenv("OPENROUTER_API_KEY"),  # explicit — never falls back to GEMINI_API_KEY
+                api_key=os.getenv("OPENAI_API_KEY"),  
             )
         except Exception as e:
             err = str(e).lower()
@@ -103,7 +103,7 @@ def _llm_completion_with_retry(model, messages, max_tokens=1200, temperature=0.3
                 raise
 
 
-# ── Chat answer — routed through OpenRouter via litellm, NOT Gemini ──────────
+# ── Chat answer — routed through OPENAI via litellm, NOT Gemini ──────────
 def ask_chat_model(question: str, context_chunks: list[dict]) -> str:
     context = "\n\n---\n\n".join(
         f"[From: {c['dataset_name']} | {c['timestamp'][:10]} | Relevance: {c['score']}]\n{c['text']}"
@@ -123,21 +123,19 @@ USER QUESTION:
 Answer in plain business English. Be specific and cite numbers where available.
 Format your answer clearly — use bullet points or short paragraphs as appropriate."""
 
-    # OpenRouter-specific env vars — kept separate from GEMINI_MODEL /
-    # GEMINI_API_KEY used everywhere else in the app.
-    model  = os.getenv("OPENROUTER_MODEL")
-    or_key = os.getenv("OPENROUTER_API_KEY")
+    
+    model   = os.getenv("MODEL")
+    api_key = os.getenv("OPENAI_API_KEY")
 
     if not model:
         return (
-            "⚠️ No chat model configured. Set the `OPENROUTER_MODEL` environment "
-            "variable in your `.env` file (e.g. `OPENROUTER_MODEL=openrouter/anthropic/claude-3.5-sonnet`)."
+            "⚠️ No chat model configured. Set the `MODEL` environment variable "
+            "in your `.env` file (e.g. `MODEL=gpt-4o-mini`)."
         )
-    if not or_key:
+    if not api_key:
         return (
-            "⚠️ `OPENROUTER_API_KEY` is not set in your `.env` file. "
-            "This page uses OpenRouter, not Gemini — add `OPENROUTER_API_KEY=sk-or-...` "
-            "to your `.env` and restart the app."
+            "⚠️ `OPENAI_API_KEY` is not set in your `.env` file. "
+            "Add `OPENAI_API_KEY=sk-...` and restart the app."
         )
 
     response = _llm_completion_with_retry(
@@ -149,6 +147,11 @@ Format your answer clearly — use bullet points or short paragraphs as appropri
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    col_home, _ = st.columns([1, 9])
+    with col_home:
+        if st.button("🏠 Home", use_container_width=True):
+            st.switch_page("home_page.py")
+
     st.markdown("""
     <div style="padding: 1.5rem 0 0.5rem 0;">
         <h1 style="margin-bottom:0;">💬 Chat with Past Reports</h1>
@@ -179,7 +182,7 @@ def main():
         """, unsafe_allow_html=True)
 
         if st.button("⬅ Go to Main Analyzer", type="primary"):
-            st.switch_page("app.py")
+            st.switch_page("home_page.py")
         return
 
     # ── Report controls (inline, no sidebar) ─────────────────────────────────
@@ -189,21 +192,21 @@ def main():
             st.markdown("**📁 Filter by dataset**")
             selected_dataset = st.selectbox(
                 "Dataset",
-                options=["All reports"] + stored,
+                options=["All reports", "None"] + stored,
                 label_visibility="collapsed",
             )
         with col_delete:
             st.markdown("**🗑️ Delete a report**")
             to_delete = st.selectbox(
-                "Report to delete", options=stored, key="del",
+                "Report to delete", options=["None"] + stored, key="del",
                 label_visibility="collapsed",
             )
-            if st.button("Delete report", type="secondary"):
+            if st.button("Delete report", type="secondary", disabled=(to_delete == "None")):
                 n = delete_report(username, to_delete)
                 st.success(f"Deleted {n} chunks for '{to_delete}'.")
                 st.rerun()
 
-    dataset_filter = None if selected_dataset == "All reports" else selected_dataset
+    dataset_filter = None if selected_dataset in ("All reports", "None") else selected_dataset
 
     # ── Dataset context card ──────────────────────────────────────────────────
     filter_label = selected_dataset if selected_dataset != "All reports" else f"{len(stored)} report(s)"

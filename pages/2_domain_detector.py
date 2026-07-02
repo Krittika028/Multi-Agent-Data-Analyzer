@@ -154,7 +154,7 @@ def main():
     if "cleaned_df" not in st.session_state:
         st.warning("No cleaned dataset found. Please upload and clean a dataset first.")
         if st.button("⬅ Go to Data Cleaner"):
-            st.switch_page("pages/1_Data_Cleaner.py")
+            st.switch_page("pages/1_data_cleaner.py")
         return
 
     df              = st.session_state["cleaned_df"]
@@ -176,7 +176,7 @@ def main():
             st.rerun()
     with col_b:
         if st.button("Continue to Analysis ➜", type="primary"):
-            st.switch_page("pages/3_Chat_Reports.py")
+            st.switch_page("pages/3_chat_reports.py")
 
 
 if __name__ == "__main__":

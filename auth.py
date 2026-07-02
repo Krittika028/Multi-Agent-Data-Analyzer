@@ -220,15 +220,6 @@ def _is_valid_email(email):
 
 def render_login_page():
     """Always returns (None, None)."""
-    st.markdown(
-    """
-    <style>
-    [data-testid="stSidebarNav"] { display: none; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-    )
-
     if st.session_state.get("auth_status") is True:
         return None, None
 

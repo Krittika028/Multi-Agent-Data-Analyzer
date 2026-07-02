@@ -13,6 +13,16 @@ Fixes vs previous version:
      (both more precise and unambiguous for charting/sorting)
   4. Fuzzy threshold uses relative edit-distance so short words are never over-merged
      and longer typo-words (Italian/Italain) always merge correctly
+  5. NEW — step4_remove_duplicates no longer collapses rows with a MISSING id
+     into "duplicates of each other". Previously, drop_duplicates(subset=[id_col])
+     treats every NaN in that column as equal, so N rows with a genuinely missing
+     ID (not yet imputed at this point in the pipeline) got reported/removed as
+     N-1 duplicates even though they're N different, real orders. Rows with a
+     null id are now excluded from id-based dedup entirely and left for
+     imputation later. A separate, always-run full-row-duplicate check (the
+     same definition a raw "duplicate rows" stat pill would use) now runs
+     alongside it, so the id-based count and the true full-row-duplicate count
+     are both reported explicitly and can never silently disagree again.
 """
 
 import pandas as pd
@@ -20,6 +30,7 @@ import numpy as np
 from datetime import datetime
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.preprocessing import LabelEncoder
+from dateutil import parser as _dateutil_parser
 import os
 import json
 import re
@@ -142,8 +153,8 @@ def _llm_detect_dtypes(column_names: list, sample_rows: list) -> dict:
     try:
         from dotenv import load_dotenv
         load_dotenv()
-        model = os.getenv("GEMINI_MODEL", "")
-        api_key = os.getenv("GEMINI_API_KEY", "")
+        model = os.getenv("MODEL", "")
+        api_key = os.getenv("OPENAI_API_KEY", "")
         if not model:
             return {}
         import litellm
@@ -182,6 +193,69 @@ No explanation, no markdown, no extra text.
         pass
     return {}
 
+def _clean_numeric_string(series: pd.Series) -> pd.Series:
+    """
+    Generic numeric cleaner — works on any dataset, any language of
+    garbage tokens. Doesn't hardcode dataset-specific words; instead:
+      1. Known universal null-markers (NULL_STRINGS) -> NaN
+      2. Strip universal numeric-formatting noise (currency, commas,
+         %, accounting parens, +/-, k/M/B suffixes)
+      3. Anything left that still isn't a valid number -> NaN via
+         pd.to_numeric(errors='coerce') — this alone catches ANY
+         garbage token ("ERROR", "N/A", "xyz", "###", emojis, etc.)
+         without needing a hardcoded word list.
+    """
+    s = series.astype(str).str.strip()
+
+    null_lower = {t.lower() for t in NULL_STRINGS}
+    s = s.where(~s.str.lower().isin(null_lower), np.nan)
+
+    s = s.str.replace(r'^\((.*)\)$', r'-\1', regex=True)         # (123.45) -> -123.45
+    s = s.str.replace(r'[₹$€£¥₩,%\s]', '', regex=True)           # currency/commas/%/spaces
+    s = s.str.replace(r'^\+', '', regex=True)                     # leading +
+
+    def _expand_unit(val):
+        if not isinstance(val, str) or val == '' or val.lower() in ('nan', 'none', '-', 'nat'):
+            return val
+        m = re.match(r'^(-?\d+\.?\d*)([kKmMbB])$', val)
+        if m:
+            num, unit = float(m.group(1)), m.group(2).lower()
+            return str(num * {'k': 1e3, 'm': 1e6, 'b': 1e9}[unit])
+        return val
+
+    s = s.apply(_expand_unit)
+    # Anything non-numeric that survives (any garbage in any dataset,
+    # any language) becomes NaN here automatically — no word list needed.
+    return pd.to_numeric(s, errors='coerce')
+
+
+def _detect_dayfirst(series: pd.Series) -> bool:
+    sample = series.dropna().astype(str).head(50)
+    pattern = re.compile(r'^(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})$')
+    day_votes = month_votes = 0
+    for val in sample:
+        m = pattern.match(val.strip())
+        if not m:
+            continue
+        a, b = int(m.group(1)), int(m.group(2))
+        if a > 12 and b <= 12: day_votes += 1
+        elif b > 12 and a <= 12: month_votes += 1
+    if day_votes != month_votes:
+        return day_votes > month_votes
+    try:
+        model, api_key = os.getenv("MODEL", ""), os.getenv("OPENAI_API_KEY", "")
+        if model:
+            import litellm
+            prompt = (f"All values below come from ONE column, same date format. "
+                      f"Is it day-first (DD-MM-YYYY) or month-first (MM-DD-YYYY)?\n"
+                      f"Sample: {json.dumps(sample.head(15).tolist())}\n"
+                      f'Respond with ONLY: "dayfirst" or "monthfirst".')
+            resp = litellm.completion(model=model, api_key=api_key,
+                messages=[{"role": "user", "content": prompt}], max_tokens=10, temperature=0)
+            return "dayfirst" in resp.choices[0].message.content.strip().lower()
+    except Exception:
+        pass
+    return False
 
 # ── Date parsing helpers ───────────────────────────────────────────────────────
 
@@ -238,8 +312,6 @@ def _try_parse_date_column(series: pd.Series) -> pd.Series:
     non_null = series.dropna()
     if len(non_null) == 0:
         return None
-
-    # Handle Unix timestamps (10-digit integers)
     try:
         numeric = pd.to_numeric(series, errors='coerce')
         unix_mask = numeric.notna() & (numeric > 1e9) & (numeric < 2e10)
@@ -250,24 +322,26 @@ def _try_parse_date_column(series: pd.Series) -> pd.Series:
     except Exception:
         pass
 
+    dayfirst = _detect_dayfirst(non_null)
+
     try:
-        converted = pd.to_datetime(series, infer_datetime_format=True, errors='coerce')
+        converted = pd.to_datetime(series, dayfirst=dayfirst, errors='coerce')
         if converted.notnull().sum() / len(non_null) >= 0.75:
             return converted
     except Exception:
         pass
 
-    for fmt in [
+    fmt_candidates = (
+        ["%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M", "%d-%m-%Y", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y"]
+        if dayfirst else
+        ["%m-%d-%Y %H:%M:%S", "%m-%d-%Y %H:%M", "%m-%d-%Y", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y"]
+    ) + [
         "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M", "%Y-%m-%d",
-        "%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M", "%d-%m-%Y",
-        "%m-%d-%Y %H:%M:%S", "%m-%d-%Y %H:%M", "%m-%d-%Y",
-        "%Y/%m/%d %H:%M:%S", "%Y/%m/%d",
-        "%d/%m/%Y %H:%M:%S", "%d/%m/%Y",
-        "%m/%d/%Y %H:%M:%S", "%m/%d/%Y",
-        "%d %b %Y", "%d %B %Y", "%b %d %Y", "%B %d %Y",
-        "%b-%Y", "%B-%Y", "%b %Y", "%B %Y",
-        "%m/%Y", "%Y%m%d",
-    ]:
+        "%Y/%m/%d %H:%M:%S", "%Y/%m/%d", "%d %b %Y", "%d %B %Y", "%b %d %Y", "%B %d %Y",
+        "%b-%Y", "%B-%Y", "%b %Y", "%B %Y", "%m/%Y", "%Y%m%d",
+    ]
+
+    for fmt in fmt_candidates:
         try:
             converted = pd.to_datetime(series, format=fmt, errors='coerce')
             if converted.notnull().sum() / len(non_null) >= 0.75:
@@ -279,7 +353,6 @@ def _try_parse_date_column(series: pd.Series) -> pd.Series:
         if pd.isnull(val):
             return pd.NaT
         s = str(val).strip()
-        # Try Unix timestamp
         try:
             n = float(s)
             if 1e9 < n < 2e10:
@@ -287,36 +360,23 @@ def _try_parse_date_column(series: pd.Series) -> pd.Series:
         except Exception:
             pass
         try:
-            return pd.to_datetime(s, infer_datetime_format=True)
+            return _dateutil_parser.parse(s, dayfirst=dayfirst)
         except Exception:
             pass
-        for fmt in [
-            "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
-            "%m-%d-%Y %H:%M:%S", "%m-%d-%Y %H:%M", "%m-%d-%Y",
-            "%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M", "%d-%m-%Y",
-            "%Y/%m/%d %H:%M:%S", "%Y/%m/%d",
-            "%m/%d/%Y %H:%M:%S", "%m/%d/%Y",
-            "%d/%m/%Y %H:%M:%S", "%d/%m/%Y",
-            "%d %b %Y %H:%M:%S", "%d %b %Y",
-            "%b %d %Y", "%B %d, %Y", "%d %B %Y",
-        ]:
+        for fmt in fmt_candidates:
             try:
                 return pd.to_datetime(s, format=fmt)
             except Exception:
                 continue
         result = _parse_month_year_string(s)
-        if result is not None:
-            return result
-        return pd.NaT
+        return result if result is not None else pd.NaT
 
     try:
         parsed = series.apply(_parse_single)
-        success_rate = parsed.notnull().sum() / len(non_null)
-        if success_rate >= 0.75:
+        if parsed.notnull().sum() / len(non_null) >= 0.75:
             return pd.to_datetime(parsed, errors='coerce')
     except Exception:
         pass
-
     return None
 
 
@@ -407,28 +467,84 @@ class DataCleaner:
         else:
             self.report.append(f"[MISSING] ✔ No missing values found")
 
-    # ── STEP 4: Remove duplicates ──────────────────────────────────────────────
+    # ── STEP 4: Remove duplicates (FIXED) ──────────────────────────────────────
     def step4_remove_duplicates(self):
+        """
+        FIXED: previously, when an id_col was found, this ran
+        drop_duplicates(subset=[id_col]) over the WHOLE dataframe — including
+        rows where id_col was still NaN at this point in the pipeline (before
+        imputation). Pandas treats every NaN as equal to every other NaN in
+        a dedup comparison, so N rows with a genuinely missing ID were
+        reported/removed as N-1 "duplicates" even though they're N different,
+        real records. That's exactly the "says 45 dups but removed 89 rows"
+        symptom — the true full-row-duplicate count (45) and the id-column
+        dedup count inflated by NaN collisions (89) disagreed silently.
+
+        Fix: rows with a missing id are now EXCLUDED from id-based dedup —
+        they're left alone here and handled later by imputation, not treated
+        as duplicates of each other. A separate, always-run, definition-
+        consistent full-row-duplicate pass then runs on top, using the exact
+        same logic a raw "duplicate rows" stat display would use, so the two
+        numbers can never contradict each other again.
+        """
         before = len(self.df)
         id_col = next((c for c in self.df.columns if c.endswith('_id') or c == 'id'), None)
+
+        id_dupes_removed = 0
+
         if id_col:
-            self.df = self.df.drop_duplicates(subset=[id_col])
-            removed = before - len(self.df)
-            if removed > 0:
-                self.report.append(f"[DUPLICATES] ✅ {removed} duplicate '{id_col}' rows removed")
-                self.issues_found.append(f"{removed} duplicates")
-                self.fixes_applied.append(f"Removed {removed} duplicates")
+            null_id_mask = self.df[id_col].isna()
+            n_null_ids   = int(null_id_mask.sum())
+
+            non_null_part = self.df[~null_id_mask]
+            null_part     = self.df[null_id_mask]
+
+            deduped_non_null = non_null_part.drop_duplicates(subset=[id_col])
+            id_dupes_removed = len(non_null_part) - len(deduped_non_null)
+
+            # Recombine — rows with a missing id are NEVER dropped here,
+            # regardless of how many other rows also happen to be missing
+            # that same id. Preserve original row order.
+            self.df = pd.concat([deduped_non_null, null_part]).sort_index()
+
+            if id_dupes_removed > 0:
+                self.report.append(
+                    f"[DUPLICATES] ✅ {id_dupes_removed} duplicate '{id_col}' rows removed "
+                    f"(rows with a genuinely repeated, non-null '{id_col}' value)"
+                )
+                self.issues_found.append(f"{id_dupes_removed} id-based duplicates")
+                self.fixes_applied.append(f"Removed {id_dupes_removed} duplicate '{id_col}' rows")
             else:
-                self.report.append(f"[DUPLICATES] ✔ No duplicates on '{id_col}'")
-        else:
+                self.report.append(f"[DUPLICATES] ✔ No duplicates found on non-null '{id_col}' values")
+
+            if n_null_ids > 0:
+                self.report.append(
+                    f"[DUPLICATES] ℹ {n_null_ids} row(s) have a missing '{id_col}' — "
+                    f"these are NOT treated as duplicates of each other (a shared missing "
+                    f"ID isn't evidence of a real duplicate); they'll be imputed later"
+                )
+
+        # ── Always run a definition-consistent, full-row duplicate check on
+        # top — this is the same "duplicate rows" definition any stat-pill/
+        # preview display should use, so it can never silently disagree with
+        # the id-based count above. ────────────────────────────────────────
+        full_row_dupes_before = int(self.df.duplicated().sum())
+        if full_row_dupes_before > 0:
             self.df = self.df.drop_duplicates()
-            removed = before - len(self.df)
-            if removed > 0:
-                self.report.append(f"[DUPLICATES] ✅ {removed} duplicate rows removed")
-                self.issues_found.append(f"{removed} duplicates")
-                self.fixes_applied.append(f"Removed {removed} duplicates")
-            else:
-                self.report.append(f"[DUPLICATES] ✔ No duplicate rows found")
+            self.report.append(
+                f"[DUPLICATES] ✅ {full_row_dupes_before} additional exact full-row "
+                f"duplicate(s) removed (every column identical)"
+            )
+            self.issues_found.append(f"{full_row_dupes_before} full-row duplicates")
+            self.fixes_applied.append(f"Removed {full_row_dupes_before} full-row duplicate(s)")
+        elif id_dupes_removed == 0 and (not id_col):
+            self.report.append(f"[DUPLICATES] ✔ No duplicate rows found")
+
+        total_removed = before - len(self.df)
+        self.report.append(
+            f"[DUPLICATES] 📊 Total rows removed as duplicates: {total_removed} "
+            f"({id_dupes_removed} by id, {full_row_dupes_before} by full-row match)"
+        )
 
     # ── STEP 5: Fix currency symbols ──────────────────────────────────────────
     def step5_fix_currency(self):
@@ -478,14 +594,14 @@ class DataCleaner:
                 self.report.append(f"[DTYPE] ✔ '{col}': classified as ID — no conversion")
                 continue
 
-            if llm_type == "numeric":
-                converted = pd.to_numeric(self.df[col], errors='coerce')
-                if converted.notnull().sum() > 0:
-                    self.df[col] = converted
-                    self.report.append(f"[DTYPE] ✅ '{col}': string → numeric (LLM)")
-                    self.fixes_applied.append(f"Converted '{col}' to numeric")
-                    fixed += 1
-                    continue
+            cleaned_numeric = _clean_numeric_string(non_null)
+            numeric_rate = cleaned_numeric.notna().sum() / len(non_null)
+            if numeric_rate > 0.50:
+                self.df[col] = _clean_numeric_string(self.df[col])
+                self.report.append(f"[DTYPE] ✅ '{col}': string → numeric ({numeric_rate:.0%} parsed; handled commas/currency/%/parentheses/units)")
+                self.fixes_applied.append(f"Converted '{col}' to numeric (robust cleaning)")
+                fixed += 1
+                continue
 
             date_keywords = [
                 'date', 'time', 'dt', 'created', 'updated', 'at', '_on',
@@ -507,14 +623,7 @@ class DataCleaner:
                     fixed += 1
                     continue
 
-            if not llm_type or llm_type == "numeric":
-                converted = pd.to_numeric(non_null, errors='coerce')
-                if converted.notnull().sum() / len(non_null) >= 0.75:
-                    self.df[col] = pd.to_numeric(self.df[col], errors='coerce')
-                    self.report.append(f"[DTYPE] ✅ '{col}': string → numeric (heuristic)")
-                    self.fixes_applied.append(f"Converted '{col}' to numeric")
-                    fixed += 1
-
+            
         if fixed == 0:
             self.report.append(f"[DTYPE] ✔ All column types are already correct")
 
@@ -528,7 +637,10 @@ class DataCleaner:
         - Skips DOB / metadata timestamps
         """
         # Pass 1: rescue remaining object columns that look like dates
+        _DERIVED_SUFFIXES = ("_year", "_month", "_month_name")
         for col in list(self.df.select_dtypes(include="object").columns):
+            if col.endswith(_DERIVED_SUFFIXES):
+                continue
             non_null = self.df[col].dropna()
             if len(non_null) == 0:
                 continue
@@ -582,6 +694,12 @@ class DataCleaner:
             month_col      = f"{col}_month"
             month_name_col = f"{col}_month_name"
 
+            # Idempotency guard: wipe any stale derived columns from a
+            # previous run before recomputing, so nothing lingers mismatched.
+            for stale in (year_col, month_col, month_name_col):
+                if stale in self.df.columns:
+                    self.df = self.df.drop(columns=[stale])
+
             n_years  = series.dt.year.nunique()
             n_months = series.dt.month.nunique()
 
@@ -590,10 +708,14 @@ class DataCleaner:
                 split_parts.append(year_col)
 
             if n_months > 1 or n_years > 1:
-                # month as integer 1-12 (precise, sortable)
-                self.df[month_col] = self.df[col].dt.month.astype("Int64")
-                # month_name as full name "January" not "Jan" (unambiguous)
-                self.df[month_name_col] = self.df[col].dt.strftime("%B")
+                import calendar
+                month_ints = self.df[col].dt.month
+                self.df[month_col] = month_ints.astype("Int64")
+                # Single source of truth: name is DERIVED from the integer,
+                # never computed independently — they can no longer disagree.
+                self.df[month_name_col] = month_ints.map(
+                    lambda m: calendar.month_name[int(m)] if pd.notna(m) else np.nan
+                )
                 split_parts.extend([month_col, month_name_col])
 
             if split_parts:
@@ -642,8 +764,8 @@ class DataCleaner:
 
         def _llm_canonical_map(col_name: str, unique_vals: list) -> dict:
             try:
-                model = os.getenv("GEMINI_MODEL", "")
-                api_key = os.getenv("GEMINI_API_KEY", "")
+                model = os.getenv("MODEL", "")
+                api_key = os.getenv("OPENAI_API_KEY", "")
                 if not model:
                     return {}
                 import litellm
@@ -704,6 +826,25 @@ Your task:
 
             non_null = self.df[col].dropna()
             if len(non_null) == 0:
+                continue
+
+            # ── SAFETY NET: catches any numeric column Step 6 missed
+            # (e.g. LLM sees only 5 sample rows and guesses "categorical"
+            # for a low-cardinality numeric column like Quantity 1-5).
+            # Converts it to numeric HERE, before any string-cleaning
+            # regex can corrupt decimal points into spaces. Dataset-agnostic.
+            numeric_probe = _clean_numeric_string(non_null)
+            if numeric_probe.notna().sum() / len(non_null) > 0.5:
+                full = _clean_numeric_string(self.df[col])
+                vals = full.dropna()
+                is_whole = bool((vals % 1 == 0).all()) if len(vals) else True
+                self.df[col] = full.round().astype("Int64") if is_whole else full.astype("float64")
+                self.report.append(
+                    f"[DTYPE] ✅ '{col}': string → {'int' if is_whole else 'float'} "
+                    f"(caught by categorical-step safety net)"
+                )
+                self.fixes_applied.append(f"Converted '{col}' to numeric (safety net)")
+                fixed += 1
                 continue
 
             nunique           = non_null.nunique()
@@ -1067,6 +1208,36 @@ Your task:
                 f"min={s.min():,.2f} | median={s.median():,.2f} | max={s.max():,.2f}"
             )
 
+    # ── STEP 12: Final dtype self-audit ─────────────────────────────────────────
+    def step12_final_dtype_audit(self):
+        """
+        Last-line safety pass: scans every remaining object column and
+        force-converts any that are still actually numeric under the hood.
+        Makes the pipeline self-correcting regardless of which earlier
+        step should have caught it — works identically on any dataset.
+        """
+        caught = 0
+        for col in self.df.columns:
+            if self.df[col].dtype != object:
+                continue
+            non_null = self.df[col].dropna()
+            if len(non_null) == 0:
+                continue
+            probe = _clean_numeric_string(non_null)
+            if probe.notna().sum() / len(non_null) > 0.5:
+                full = _clean_numeric_string(self.df[col])
+                vals = full.dropna()
+                is_whole = bool((vals % 1 == 0).all()) if len(vals) else True
+                self.df[col] = full.round().astype("Int64") if is_whole else full.astype("float64")
+                self.report.append(
+                    f"[DTYPE-AUDIT] ✅ '{col}': force-converted to "
+                    f"{'int' if is_whole else 'float'} on final pass"
+                )
+                self.fixes_applied.append(f"Final-pass numeric conversion for '{col}'")
+                caught += 1
+        if caught == 0:
+            self.report.append("[DTYPE-AUDIT] ✔ Final audit: no numeric-as-text columns remain")
+
     # ── Final verdict ──────────────────────────────────────────────────────────
     def _generate_verdict(self):
         if not self.issues_found and not self.fixes_applied:
@@ -1100,12 +1271,12 @@ Your task:
         self.step6_fix_data_types()
         self.step6b_split_dates()
         self.step7_standardize_categoricals()
+        self.step12_final_dtype_audit()
         self.step8_fix_corrupted_ids()
         self.step9_rf_impute_missing()
         self.step9b_post_imputation_clip()   
         self.step10_cap_outliers()
         self.step11_numeric_summary()
-
         self.report.append("─" * 60)
         self._generate_verdict()
 

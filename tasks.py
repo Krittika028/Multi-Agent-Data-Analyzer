@@ -1,10 +1,86 @@
 """
 tasks.py
+
+Updated:
+  1. DATA RELIABILITY RULES — every task that consumes verified_stats now
+     explicitly checks the sample-size guard fields added in stats_engine.py
+     (insufficient_edge_data, excluded_years, start_sample_size, end_sample_size,
+     total_sample_size, min_sample_size_required) before it's allowed to state
+     a percentage change as fact. A null/flagged metric gets narrated as
+     "not enough data to compare" — never silently skipped, never invented.
+  2. ANALYST-GRADE KPI FRAMING — the analyst and report agents are now told
+     to behave like a human analyst, not a numbers dictation service: compute
+     and cite ratios (revenue per transaction, mean-vs-median gap as a skew
+     signal), flag concentration risk, and connect every number to a decision
+     — not just repeat totals/means/medians verbatim.
 """
 
 import json
 from crewai import Task
 from agents import get_cleaner_agent, get_analyst_agent, get_report_agent
+
+
+# ── Shared reliability contract injected into every stats-consuming task ─────
+DATA_RELIABILITY_RULES = """
+DATA RELIABILITY RULES (apply before citing ANY trend or period comparison):
+
+The verified statistics package includes explicit sample-size guard fields.
+You MUST check these before stating a percentage change, trend, or "X vs Y"
+comparison as fact:
+
+- In "trends": if "insufficient_edge_data" is true, the start_value/end_value/
+  pct_change_start_to_end for that metric are NOT reliable — do not report
+  the percentage. Instead say something like: "There isn't enough data at
+  the start or end of the period to measure a reliable change for [metric]."
+  Always check "total_sample_size", "start_sample_size", "end_sample_size"
+  before treating a trend as a real business signal, and if you do use a
+  trend, silently reflect that reliability rather than naming numeric fields.
+
+- In "period_trends": if "yoy_pct_change" is null, do NOT invent a YoY number.
+  Check "excluded_years" — if a year was excluded, explain briefly that a
+  year had too few orders/records to be a fair comparison (state the record
+  count if given), rather than comparing it to a full year anyway. Never
+  describe a period with very few records as a "collapse", "crash", or
+  "plummet" — that language implies a real business event, not a data gap.
+
+- Never present a percentage change, before/after comparison, or trend
+  direction that is null, flagged insufficient, or built from an excluded
+  period. If the only available comparison is unreliable, say so honestly
+  and pivot to what IS reliable (totals, category breakdowns, correlations).
+
+- When in doubt about whether a number is trustworthy, prefer describing
+  what is definitely true (totals, counts, top/bottom performers) over a
+  fragile percentage swing.
+"""
+
+# ── Shared instruction for analyst-grade KPI framing (not vanity numbers) ────
+ANALYST_FRAMING_RULES = """
+ANALYST-GRADE FRAMING (write like a human analyst, not a numbers dictation service):
+
+For every KPI or metric you cite, don't just restate mean/median/total —
+add the one layer of judgment a real analyst would:
+
+- Ratios over raw totals where possible: revenue per transaction, revenue
+  per customer, discount as % of revenue, cost per unit, etc. These are
+  usually more decision-relevant than a raw total alone.
+- Mean vs median gap = a skew signal, not just two numbers. If mean is
+  meaningfully higher than median, say what that implies (a small number
+  of large orders/outliers are pulling the average up — the "typical"
+  order is smaller than the headline average suggests). If mean and
+  median are close, say the metric is consistent/predictable.
+- Concentration risk: if one category/channel/segment accounts for a
+  disproportionate share of revenue or volume relative to its count,
+  name that explicitly as a dependency risk, not just "top performer."
+- Context over isolated numbers: don't just say "Average Order Value is
+  $1,706.74" — say what that means relative to the median, relative to
+  other categories, or relative to what it implies about customer
+  behavior (e.g. are most orders small with a few large outliers, or is
+  spending fairly uniform?).
+- Every recommendation must trace to a SPECIFIC number and explain the
+  mechanism — not "improve marketing" but "X channel drives only Y% of
+  revenue despite Z% of transaction volume — investigate why conversion
+  value is low there."
+"""
 
 
 def get_cleaning_task(cleaning_report: list, dataset_info: str):
@@ -75,23 +151,31 @@ VERIFIED STATISTICS (ground truth — use only these numbers):
 Cleaning Context:
 {cleaning_context}
 
+{DATA_RELIABILITY_RULES}
+
+{ANALYST_FRAMING_RULES}
+
 Your output must follow this structure EXACTLY:
 
 **Executive Summary**
 - Key numeric totals (e.g. Total Revenue, Total Transactions)
-- Average Order Value or equivalent primary metric
-- 3–4 bullet points summarizing the most important patterns
-- Keep it factual and concise
+- Average Order Value or equivalent primary metric, with mean-vs-median
+  context (see ANALYST-GRADE FRAMING above)
+- 3–4 bullet points summarizing the most important RELIABLE patterns
+- Keep it factual and concise — no unreliable percentage claims
 
 **Core Business KPIs**
 Present as a markdown table:
-| KPI | Value |
-Include: totals, averages, highest/lowest performing category, best/worst period.
+| KPI | Value | What it means |
+Include: totals, averages (with mean-vs-median skew note where relevant),
+highest/lowest performing category, best/worst period. The third column
+should add analyst judgment, not repeat the number.
 
 **Category / Product / Segment Performance** (use whatever dimension fits the data)
 - Revenue or volume breakdown per category as a markdown table
 - Revenue per unit or per transaction as a separate markdown table
-- 1–2 sentence insight below each table explaining what it means
+- 1–2 sentence insight below each table naming any concentration risk or
+  cross-sell opportunity — not just describing the numbers
 
 **Customer / Behavioral Patterns** (if applicable)
 - Volume leaders vs revenue leaders — are they the same?
@@ -100,23 +184,27 @@ Include: totals, averages, highest/lowest performing category, best/worst period
 
 **Channel / Segment Split** (if applicable)
 - Breakdown table by channel, region, or segment
-- Is revenue balanced or concentrated?
+- Is revenue balanced or concentrated? Name the concentration risk if one exists.
 - What does the distribution suggest?
 
 **Time / Period Analysis**
 - Monthly, quarterly, or yearly breakdown table
-- Identify best and worst periods with exact numbers
-- Is the trend growing, declining, or flat?
+- Identify best and worst periods with exact numbers — but ONLY periods
+  that clear the sample-size guard (check excluded_years / insufficient_edge_data)
+- Is the trend growing, declining, or flat? If not enough reliable data
+  exists to say, state that plainly instead of guessing
 
 **Top 5 Business Insights**
 Numbered list. Each insight must:
-- State an exact number from the verified stats
-- Explain what it means for the business in plain English
+- State an exact, RELIABLE number from the verified stats (never a flagged
+  or excluded one)
+- Explain what it means for the business in plain English, with analyst
+  judgment (ratio, concentration, skew — not just the raw figure)
 - Name one specific opportunity or risk it creates
 
 **Strategic Recommendations**
 Exactly 5 recommendations. Each must:
-- Be grounded in a specific number from the analysis
+- Be grounded in a specific, reliable number from the analysis
 - Name a concrete action (e.g. "Bundle Coffee + Cake to increase basket size")
 - State the expected business outcome
 - Be written in plain operational language — no jargon
@@ -130,7 +218,9 @@ important action the business should take right now.
             "A structured BI analysis with executive summary, KPI table, "
             "category/segment breakdown tables, behavioral insights, "
             "channel split, time analysis, top 5 insights, 5 recommendations, "
-            "and a management takeaway — all grounded in exact verified numbers."
+            "and a management takeaway — all grounded in exact, reliable "
+            "verified numbers with analyst-grade context (ratios, skew, "
+            "concentration risk), never a flagged or insufficient-sample metric."
         ),
     )
 
@@ -152,10 +242,16 @@ STRICT RULES:
 - Do NOT include any "Data Quality" section or data caveats of any kind.
 - Write ONLY about business performance, metrics, trends, and recommendations.
 - Every number must be preserved exactly as given in the analysis.
+- If the analysis explicitly notes a metric had insufficient data to reliably
+  compare, preserve that honesty in the report rather than smoothing it into
+  a confident percentage — say "not enough data to compare" in plain business
+  language instead of a caveat-flavored data disclaimer.
 - Keep all markdown tables intact and properly formatted.
 - Write in plain operational English — no jargon, no abstract strategy language.
 - Every recommendation must reference a specific number.
 - Every insight must be grounded in a metric from the analysis.
+
+{ANALYST_FRAMING_RULES}
 
 Output the report in this exact structure:
 
@@ -165,14 +261,15 @@ Output the report in this exact structure:
 3–4 bullet points covering:
 - Key revenue or volume totals with exact numbers
 - Top performing category/product/segment with its exact revenue or volume
-- Most important trend observed
+- Most important RELIABLE trend observed (skip if none clear the bar)
 - Single most important opportunity
 
 ## Core Business KPIs
 Markdown table:
-| KPI | Value |
+| KPI | Value | What it means |
 Include: all key totals, averages, top performer, bottom performer,
-best period, worst period.
+best period, worst period. Third column carries analyst judgment
+(ratio, skew, or context) — never just a restated number.
 
 ## [Primary Dimension] Performance
 Replace [Primary Dimension] with whatever fits — Product, Category,
@@ -180,7 +277,7 @@ Region, Customer Segment, etc.
 
 Sub-section 1: Revenue or Volume Breakdown
 Markdown table sorted by revenue or volume descending.
-Follow with 1–2 sentence insight.
+Follow with 1–2 sentence insight naming any concentration risk.
 
 Sub-section 2: Revenue per Unit / per Transaction (if applicable)
 Markdown table.
@@ -201,13 +298,15 @@ Markdown table of revenue or volume by channel and/or payment method.
 Markdown table: Month | Revenue (or volume).
 Follow with:
 - Best month and worst month with exact numbers
-- Is the overall trend growing, flat, or declining?
+- Is the overall trend growing, flat, or declining — based only on periods
+  with enough data to be trustworthy? If not enough reliable history exists,
+  say so plainly instead of forcing a trend claim.
 - What does the pattern suggest the business should do?
 
 ## Top 5 Business Insights
 Numbered. Each insight:
-1. States an exact number
-2. Explains the business meaning in one sentence
+1. States an exact, reliable number
+2. Explains the business meaning in one sentence, with analyst judgment
 3. Names the specific opportunity or risk it creates
 
 ## Strategic Recommendations
@@ -227,8 +326,9 @@ Expected outcome: [what business result this drives]
         agent=get_report_agent(),
         expected_output=(
             "A clean business performance report with no mention of data, "
-            "cleaning, or quality issues. Contains: executive summary bullets, "
-            "KPI table, primary dimension breakdown tables with insights, "
+            "cleaning, or quality issues, and no unreliable/flagged percentage "
+            "claims. Contains: executive summary bullets, KPI table with analyst "
+            "judgment column, primary dimension breakdown tables with insights, "
             "behavioral patterns grounded in numbers, channel/payment tables, "
             "monthly trend table, 5 numbered insights, 5 concrete recommendations "
             "each with action and expected outcome, and a management takeaway."
@@ -246,15 +346,21 @@ Write a SHORT business performance paragraph for an executive dashboard —
 
 This is the first thing a business reader sees. It must:
 1. State what kind of business activity this data covers (1 sentence)
-2. Name the single most important performance finding with its exact number (1 sentence)
+2. Name the single most important RELIABLE performance finding with its
+   exact number (1 sentence) — check the sample-size guard fields below
+   before citing any percentage change
 3. Give ONE specific opportunity or action the business should take (1 sentence)
 4. Optionally name the biggest risk or watch item (1 sentence)
+
+{DATA_RELIABILITY_RULES}
 
 Rules:
 - No mention of data cleaning, missing values, data quality, or imputation
 - No section headers, no bullet points
 - No statistical jargon ('mean', 'r_squared', 'std', 'coefficient')
 - Do not describe the dataset shape or column names
+- Never state a percentage change, trend, or before/after comparison that
+  is null or flagged as insufficient/excluded in the verified statistics
 - Every sentence must be useful to a business reader
 
 Dataset name: {dataset_name}
@@ -267,8 +373,9 @@ Output ONLY the paragraph. No title, no "Summary:" prefix, no markdown.
         agent=get_analyst_agent(),
         expected_output=(
             "A 3-5 sentence business performance paragraph: what the business "
-            "does, the top performance finding with its exact number, one "
-            "specific opportunity or action, and optionally one risk. "
-            "No data/cleaning references. Plain prose only."
+            "does, the top RELIABLE performance finding with its exact number, "
+            "one specific opportunity or action, and optionally one risk. "
+            "No data/cleaning references, no unreliable percentage claims. "
+            "Plain prose only."
         ),
     )

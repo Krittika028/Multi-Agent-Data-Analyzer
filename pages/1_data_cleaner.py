@@ -203,12 +203,21 @@ def main():
 
     if clean_clicked:
         current_df = st.session_state["raw_df"]
-        with st.spinner("Running cleaning pipeline (this may take a moment for RF imputation)..."):
+        with st.spinner("Running adaptive cleaning pipeline (profiling → adaptive imputation → ensemble outlier voting)..."):
             cleaner    = DataCleaner(current_df)
             cleaned_df, report = cleaner.clean()
 
         st.session_state["cleaned_df"]      = cleaned_df
-        st.session_state["cleaning_report"] = {"log": report}
+        # column_profile / column_classification are now populated for real
+        # (previously an empty dict), so domain_detector.py gets actual
+        # evidence to reason over instead of guessing from raw columns alone.
+        st.session_state["cleaning_report"] = {
+            "log":                   report,
+            "column_profile":        cleaner.get_profile(),
+            "column_classification": cleaner.get_classification(),
+        }
+        st.session_state["cleaning_scorecard"] = cleaner.get_scorecard()
+        st.session_state["near_duplicates"]    = cleaner.get_near_duplicates()
         st.success("Dataset cleaned successfully.")
 
     # ── Results ───────────────────────────────────────────────────────────────
@@ -218,13 +227,36 @@ def main():
         render_stat_pills(st.session_state["cleaned_df"])
         st.dataframe(st.session_state["cleaned_df"].head(15), use_container_width=True, height=320)
 
+        # ── Cleaning Impact Scorecard ────────────────────────────────────────
+        scorecard = st.session_state.get("cleaning_scorecard")
+        if scorecard:
+            st.subheader("📊 Data Health Scorecard")
+            before, after = scorecard["before"], scorecard["after"]
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Overall Grade", f"{before['grade']} → {after['grade']}",
+                       f"+{scorecard['delta_points']} pts" if scorecard['delta_points'] >= 0 else f"{scorecard['delta_points']} pts")
+            c2.metric("Completeness", f"{after['completeness_pct']}%", f"{after['completeness_pct']-before['completeness_pct']:+.1f}")
+            c3.metric("Uniqueness", f"{after['uniqueness_pct']}%", f"{after['uniqueness_pct']-before['uniqueness_pct']:+.1f}")
+            c4.metric("Validity", f"{after['validity_pct']}%", f"{after['validity_pct']-before['validity_pct']:+.1f}")
+            c5.metric("Consistency", f"{after['consistency_pct']}%", f"{after['consistency_pct']-before['consistency_pct']:+.1f}")
+
+            near_dupes = st.session_state.get("near_duplicates", [])
+            if near_dupes:
+                with st.expander(f"🔍 {len(near_dupes)} possible near-duplicate row pair(s) — review only, nothing was auto-removed", expanded=False):
+                    st.caption(
+                        "These rows are highly similar but not identical (e.g. a typo'd name or a re-keyed "
+                        "field). They were intentionally NOT auto-deleted — collapsing two genuinely distinct "
+                        "records is worse than leaving a near-duplicate in place. Review manually if needed."
+                    )
+                    st.dataframe(pd.DataFrame(near_dupes[:50]), use_container_width=True, height=200)
+
         with st.expander("📜 Full Cleaning Report", expanded=False):
             for line in st.session_state["cleaning_report"]["log"]:
                 st.text(line)
 
         st.divider()
         if st.button("Continue to Domain Detection ➜", type="primary"):
-            st.switch_page("pages/2_Domain_Detector.py")
+            st.switch_page("pages/2_domain_detector.py")
 
 
 if __name__ == "__main__":

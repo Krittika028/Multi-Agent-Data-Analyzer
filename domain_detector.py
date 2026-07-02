@@ -33,8 +33,8 @@ class DomainDetector:
 
     def __init__(self, llm=None):
         self.llm = llm or LLM(
-            model=os.getenv("GEMINI_MODEL"),
-            api_key=os.getenv("GEMINI_API_KEY"),
+            model=os.getenv("MODEL"),
+            api_key=os.getenv("OPENAI_API_KEY"),
         )
 
         self.agent = Agent(

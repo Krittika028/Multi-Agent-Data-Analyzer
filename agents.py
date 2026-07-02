@@ -44,13 +44,11 @@ def _llm_completion_with_retry(model, messages, max_tokens=1000, temperature=0.7
 
 
 def _build_llm(model_override=None):
-    model    = model_override or os.getenv("GEMINI_MODEL")
-    fallback = os.getenv("GEMINI_FALLBACK_MODEL")
-    api_key  = os.getenv("GEMINI_API_KEY")
+    model    = model_override or os.getenv("MODEL")
+    api_key  = os.getenv("OPENAI_API_KEY")
     return LLM(
         model=model,
         api_key=api_key,
-        fallbacks=[fallback] if fallback else [],
         max_retries=MAX_RETRIES,
         timeout=120,
     )

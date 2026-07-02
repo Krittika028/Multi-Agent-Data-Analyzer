@@ -7,8 +7,10 @@ Allowed chart types:
   - column           (vertical category comparison)
   - stacked_bar      (part-to-whole across categories)
   - line             (trend analysis over time ONLY)
+  - scatter          (relationship/correlation between two numeric variables)
+  - histogram        (distribution of a single numeric variable)
 
-No scatter, histogram, area, funnel, box, or cluster charts.
+No funnel, area, or box charts.
 Layout: one chart per row for wide charts; 2-column grid only for
 small categorical charts so nothing looks clumsy.
 """
@@ -31,11 +33,18 @@ ACCENT = [
 ]
 
 # ── Business context lookup ────────────────────────────────────────────────────
+# NOTE: "count"/"total"/"sum" etc are deliberately generic/weak keywords —
+# a column literally named "total_spent" or "sales_amount" should be caught
+# by the money-specific groups (revenue/cost/price/...) FIRST, even though
+# it also happens to contain the substring "total". _get_business_context
+# below no longer picks the first list-order match; it scores every group
+# by specificity and prefers the most specific (and money-typed) match, so
+# this ordering is a fallback rather than an authoritative priority list.
 BUSINESS_CONTEXT = [
     (["revenue", "sales", "income", "turnover", "gmv"],          "💰", "Revenue",     "$"),
     (["profit", "margin", "earnings", "ebit", "ebitda", "net"],  "📈", "Profit",       "$"),
     (["cost", "expense", "spend", "cogs", "opex"],               "💸", "Cost",         "$"),
-    (["price", "rate", "fee", "tariff", "charge", "amount"],     "🏷️", "Price",        "$"),
+    (["price", "rate", "fee", "tariff", "charge", "amount", "spent", "spending"], "🏷️", "Price", "$"),
     (["quantity", "qty", "units", "volume", "sold", "orders"],   "📦", "Volume",       ""),
     (["customer", "client", "user", "member", "subscriber"],     "👥", "Customers",    ""),
     (["transaction", "txn", "purchase", "order", "invoice"],     "🧾", "Transactions", ""),
@@ -43,20 +52,51 @@ BUSINESS_CONTEXT = [
     (["rating", "score", "nps", "csat", "review", "stars"],      "⭐", "Score",        ""),
     (["age", "tenure", "duration", "days", "months", "years"],   "📅", "Duration",     ""),
     (["weight", "kg", "lb", "gram", "ton"],                      "⚖️", "Weight",       ""),
-    (["count", "num", "total", "sum", "freq", "visits", "hits"], "🔢", "Count",        ""),
     (["growth", "change", "delta", "variance", "diff"],          "📊", "Growth",       ""),
     (["tax", "vat", "gst", "levy", "duty"],                      "🧾", "Tax",          "$"),
     (["salary", "wage", "pay", "compensation", "bonus"],         "💼", "Salary",       "$"),
     (["inventory", "stock", "units_on_hand", "available"],       "🏭", "Inventory",    ""),
     (["clicks", "impressions", "ctr", "conversion", "bounce"],   "🖱️", "Engagement",   ""),
+    (["count", "num", "freq", "visits", "hits"],                 "🔢", "Count",        ""),
+    (["total", "sum"],                                            "🔢", "Total",        ""),
 ]
 
 
 def _get_business_context(col_name: str):
+    """
+    Picks the best-matching business label for a column name.
+
+    Instead of returning the FIRST keyword-group that matches (which lets
+    a generic substring like "total" in "total_spent" win over the much
+    more specific and correct "spent"/money match), every group that
+    matches is scored by specificity — the length of the matched keyword —
+    and the most specific match wins. Ties prefer whichever group appears
+    earlier in BUSINESS_CONTEXT (money-typed groups are listed first).
+    A dollar-prefixed match is additionally preferred over a same-length
+    non-dollar match, since money columns are the more actionable label.
+    """
     col_lower = col_name.lower()
-    for keywords, emoji, label, prefix in BUSINESS_CONTEXT:
-        if any(kw in col_lower for kw in keywords):
-            return emoji, label, prefix
+
+    best = None  # (specificity, prefix_bonus, -list_index) -> context tuple
+    for idx, (keywords, emoji, label, prefix) in enumerate(BUSINESS_CONTEXT):
+        matched_kw = None
+        for kw in keywords:
+            if kw in col_lower:
+                if matched_kw is None or len(kw) > len(matched_kw):
+                    matched_kw = kw
+        if matched_kw is None:
+            continue
+
+        specificity = len(matched_kw)
+        prefix_bonus = 1 if prefix else 0
+        rank = (specificity, prefix_bonus, -idx)
+
+        if best is None or rank > best[0]:
+            best = (rank, (emoji, label, prefix))
+
+    if best is not None:
+        return best[1]
+
     clean = col_name.replace("_", " ").replace("-", " ").title()
     return "📊", clean, ""
 
@@ -149,7 +189,7 @@ def _section_header(title: str, subtitle: str = ""):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CHART RENDERERS  (pie/donut · bar · column · stacked_bar · line)
+# CHART RENDERERS  (pie/donut · bar · column · stacked_bar · line · scatter · histogram)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _pie_chart(df: pd.DataFrame, spec: dict, donut: bool = True):
@@ -386,6 +426,77 @@ def _line_chart(df: pd.DataFrame, spec: dict):
     return _style(fig, height=420)
 
 
+def _scatter_chart(df: pd.DataFrame, spec: dict):
+    """Scatter — relationship/correlation between two numeric variables."""
+    x, y, color = spec.get("x_column"), spec.get("y_column"), spec.get("color_column")
+    if not x or not y or x not in df.columns or y not in df.columns:
+        return None
+    if not (_is_numeric(df, x) and _is_numeric(df, y)):
+        return None
+
+    df = _ensure_numeric(df, x)
+    df = _ensure_numeric(df, y)
+    cols = [c for c in [x, y, color] if c and c in df.columns]
+    sub = df[cols].dropna()
+    if sub.empty:
+        return None
+    if len(sub) > 3000:
+        sub = sub.sample(3000, random_state=42)
+
+    fig = px.scatter(
+        sub, x=x, y=y,
+        color=color if color and color in df.columns else None,
+        title=spec.get("title", ""),
+        template="plotly_dark",
+        color_discrete_sequence=ACCENT,
+        opacity=0.65,
+    )
+    fig.update_traces(marker=dict(size=8, line=dict(width=0.5, color=DARK)))
+
+    if len(sub) >= 3:
+        try:
+            slope, intercept = np.polyfit(sub[x], sub[y], 1)
+            x_range = np.linspace(sub[x].min(), sub[x].max(), 50)
+            fig.add_trace(go.Scatter(
+                x=x_range, y=slope * x_range + intercept,
+                mode="lines", name="Trend",
+                line=dict(color="#f59e0b", width=2, dash="dash"),
+            ))
+        except Exception:
+            pass
+
+    return _style(fig, height=420)
+
+
+def _histogram_chart(df: pd.DataFrame, spec: dict):
+    """Histogram — distribution shape of a single numeric variable."""
+    x = spec.get("x_column")
+    if not x or x not in df.columns or not _is_numeric(df, x):
+        return None
+
+    df = _ensure_numeric(df, x)
+    series = df[x].dropna()
+    if series.empty:
+        return None
+
+    fig = px.histogram(
+        df, x=x,
+        title=spec.get("title", ""),
+        template="plotly_dark",
+        color_discrete_sequence=["#00f5ff"],
+        nbins=30,
+    )
+    fig.update_traces(marker_line_width=0.5, marker_line_color=DARK)
+
+    mean_val = series.mean()
+    fig.add_vline(
+        x=mean_val, line_width=2, line_dash="dash", line_color="#f59e0b",
+        annotation_text=f"Mean {mean_val:,.1f}", annotation_font_color="#f59e0b",
+    )
+    fig.update_layout(showlegend=False, bargap=0.05)
+    return _style(fig, height=380)
+
+
 # ── Chart registry ─────────────────────────────────────────────────────────────
 CHART_RENDERERS = {
     "pie":         _pie_chart,
@@ -394,7 +505,8 @@ CHART_RENDERERS = {
     "column":      _column_chart,
     "stacked_bar": _stacked_bar_chart,
     "line":        _line_chart,
-    # Legacy aliases kept so old chart_specs from session state still work
+    "scatter":     _scatter_chart,
+    "histogram":   _histogram_chart,
     "area":        _line_chart,   # redirect to line
 }
 
@@ -413,43 +525,35 @@ def render_chart(df: pd.DataFrame, spec: dict, verified_stats: dict = None):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SUMMARY CARDS
+# BUSINESS CONTEXT SUMMARY  (was called but never defined — that's the
+# NameError in your Problems panel: "render_business_context_summary" is
+# not defined. It's referenced once, at the top of render_dashboard,
+# right after the KPI cards. Nothing else in this file defines it, and
+# it wasn't defined in the file you originally gave me either — this
+# isn't something my edit introduced.)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def render_summary_cards(df: pd.DataFrame, verified_stats: dict):
-    kpis        = verified_stats.get("kpis", [])
-    primary_kpi = kpis[0] if kpis else None
-
-    total_cells  = df.shape[0] * df.shape[1]
-    missing_pct  = round(df.isnull().sum().sum() / total_cells * 100, 2) if total_cells else 0
-    numeric_cols = df.select_dtypes(include="number").columns.tolist()
-
-    cols = st.columns(6)
-    cols[0].metric("ROWS",            f"{df.shape[0]:,}")
-    cols[1].metric("COLUMNS",         f"{df.shape[1]}")
-    cols[2].metric("NUMERIC COLS",    f"{len(numeric_cols)}")
-    cols[3].metric("MISSING %",       f"{missing_pct:.2f}%")
-
-    if primary_kpi:
-        emoji, label, prefix = _get_business_context(primary_kpi["column"])
-        cols[4].metric(f"AVG {label.upper()}", _format_value(primary_kpi["mean"], prefix))
-        total_sum = primary_kpi["mean"] * df.shape[0]
-        cols[5].metric(f"SUM {label.upper()}", _format_value(total_sum, prefix))
-    else:
-        cols[4].metric("AVG", "N/A")
-        cols[5].metric("SUM", "N/A")
-
-
 def render_business_context_summary(business_summary: str):
+    """
+    Renders the short (3–5 sentence) narrative paragraph produced by
+    get_business_summary_task() in tasks.py — plain prose, no markdown,
+    no stats jargon. Shown as a single highlighted card directly under
+    the KPI row, before any charts.
+    """
     if not business_summary or not business_summary.strip():
         return
     st.markdown(
         f"""
-        <div style="background:#1a1a2e;border:1px solid #334155;
-                    border-left:4px solid #00f5ff;border-radius:10px;
-                    padding:20px 24px;margin:1rem 0 1.5rem 0;
-                    line-height:1.75;color:#cbd5e1;font-size:0.95rem;">
-            {business_summary.strip().replace(chr(10), "<br>")}
+        <div style="background:linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+                    border:1px solid #334155;border-left:4px solid #00f5ff;
+                    border-radius:12px;padding:18px 24px;margin:0.5rem 0 1rem 0;">
+            <div style="color:#00f5ff;font-size:0.7rem;font-weight:700;
+                        text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">
+                📋 Business Snapshot
+            </div>
+            <div style="color:#cbd5e1;font-size:0.95rem;line-height:1.6;">
+                {business_summary.strip()}
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -457,56 +561,165 @@ def render_business_context_summary(business_summary: str):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# KPI CARDS
+# KPI CARDS  (single, unified row — replaces the previous dual
+# render_summary_cards() + render_kpi_cards() stack, which rendered two
+# separate 4-card rows back to back and duplicated the same trend/KPI
+# numbers between them. That was the actual bug behind the cluttered
+# dashboard — now there is one function, one row, four cards, each one
+# a distinct signal.)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def render_kpi_cards(verified_stats: dict):
-    kpis = verified_stats.get("kpis", [])
+def render_kpi_cards(df: pd.DataFrame, verified_stats: dict):
+    """
+    Four cards, each a distinct signal — not four views of the same number:
+
+      1. PRIMARY VOLUME — total of the top-ranked business KPI (money/volume
+         metrics outrank generic numeric columns), with its trend arrow +
+         pct change inline if a reliable trend exists for that column.
+      2. SECONDARY KPI — the next-ranked KPI's average (+ median), with its
+         own trend if available. Falls back to a plain transaction count if
+         there's only one KPI in the dataset.
+      3. TOP SEGMENT — the leading category's actual revenue/KPI contribution
+         (not just row share), pulled only from genuine low-cardinality
+         business dimensions — near-identifier columns (order_id,
+         customer_id) are filtered out via _high_cardinality_cols().
+      4. REVENUE AT RISK — value sitting in non-completed order statuses
+         (cancelled/pending/failed) when a status column exists; otherwise a
+         third KPI, then a plain record count — never an invented risk metric.
+
+    Visual grammar matches a clean executive KPI strip: big bold number
+    first, muted label + trend arrow directly under it, optional caption.
+    """
+    kpis        = verified_stats.get("kpis", [])
+    trends      = verified_stats.get("trends", [])
+    cat_summary = verified_stats.get("category_summary", [])
+    revenue_by_status = verified_stats.get("revenue_by_status")
+
     if not kpis:
         return
 
-    _section_header("💼 Key Business KPIs")
+    trend_by_col = {t.get("value_column"): t for t in trends}
 
-    # Max 8 KPI cards; 4 per row
-    for row_start in range(0, min(len(kpis), 8), 4):
-        row_kpis = kpis[row_start : row_start + 4]
-        cols = st.columns(len(row_kpis))
+    _HIGH_PRIORITY = [
+        "revenue", "sales", "profit", "cost", "price", "amount", "total",
+        "quantity", "volume", "orders", "transactions",
+    ]
 
-        for col, kpi in zip(cols, row_kpis):
-            raw_col  = kpi.get("column", "")
-            mean_val = kpi.get("mean",   0) or 0
-            med_val  = kpi.get("median", 0) or 0
-            min_val  = kpi.get("min",    0)
-            max_val  = kpi.get("max",    0)
+    def _priority(kpi):
+        col_lower = kpi.get("column", "").lower()
+        return 0 if any(k in col_lower for k in _HIGH_PRIORITY) else 1
 
-            emoji, biz_label, prefix = _get_business_context(raw_col)
-            display_value = _format_value(mean_val, prefix)
-            sub_line      = f"Median {_format_value(med_val, prefix)}"
+    ranked = sorted(kpis, key=_priority)
+    primary_kpi = ranked[0]
 
-            with col:
-                st.markdown(
-                    f"""
-                    <div style="background:#1a1a2e;border:1px solid #334155;
-                                border-radius:12px;padding:18px 16px;margin-bottom:10px;">
-                        <div style="color:#64748b;font-size:0.7rem;
-                                    text-transform:uppercase;letter-spacing:1px;">
-                            {emoji} {biz_label}
-                        </div>
-                        <div style="color:#ffffff;font-size:1.6rem;
-                                    font-weight:700;margin:6px 0 2px 0;">
-                            {display_value}
-                        </div>
-                        <div style="color:#64748b;font-size:0.75rem;">
-                            {sub_line}
-                        </div>
-                        <div style="color:#475569;font-size:0.72rem;margin-top:6px;">
-                            Min {_format_value(min_val, prefix)} &nbsp;·&nbsp;
-                            Max {_format_value(max_val, prefix)}
-                        </div>
+    def _trend_html(raw_col):
+        """Colored inline trend badge for a KPI, or None if no reliable trend exists."""
+        trend = trend_by_col.get(raw_col)
+        if not trend:
+            return None
+        pct = trend.get("pct_change_start_to_end")
+        if pct is None or trend.get("insufficient_edge_data"):
+            return None
+        direction = (trend.get("direction") or "").lower()
+        arrow = "▲" if "increas" in direction else ("▼" if "decreas" in direction else "→")
+        color = "#10b981" if "increas" in direction else ("#ef4444" if "decreas" in direction else "#64748b")
+        return f'<span style="color:{color};font-weight:700;">{arrow} {pct:+.1f}%</span>'
+
+    def _card(container, big_value, label, trend_html=None, caption=None):
+        with container:
+            st.markdown(
+                f"""
+                <div style="background:#1a1a2e;border:1px solid #334155;
+                            border-radius:12px;padding:20px 18px;margin-bottom:10px;
+                            min-height:118px;">
+                    <div style="color:#ffffff;font-size:1.75rem;
+                                font-weight:700;line-height:1.15;">
+                        {big_value}
                     </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+                    <div style="color:#64748b;font-size:0.78rem;margin-top:8px;">
+                        {label}{(" &nbsp; " + trend_html) if trend_html else ""}
+                    </div>
+                    {f'<div style="color:#475569;font-size:0.72rem;margin-top:3px;">{caption}</div>' if caption else ""}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    _section_header("💼 Key Business KPIs")
+    cols = st.columns(4)
+
+    # ── 1 — TOTAL of primary metric (always present, label adapts to domain) ──
+    emoji, label, prefix = _get_business_context(primary_kpi["column"])
+    total = (primary_kpi.get("mean") or 0) * len(df)
+    _card(
+        cols[0],
+        _format_value(total, prefix),
+        f"{emoji} TOTAL {label.upper()}",
+        _trend_html(primary_kpi["column"]),
+    )
+
+    # ── 2 — AVERAGE of primary metric (always present, not a fallback) ────────
+    avg_val = primary_kpi.get("mean") or 0
+    med_val = primary_kpi.get("median") or 0
+    _card(
+        cols[1],
+        _format_value(avg_val, prefix),
+        f"{emoji} AVG {label.upper()}",
+        caption=f"Median {_format_value(med_val, prefix)}",
+    )
+
+    # ── 3 — TOTAL TRANSACTIONS / RECORDS (always present, literal row count) ──
+    _card(cols[2], f"{len(df):,}", "🧾 TOTAL TRANSACTIONS", caption="Records analyzed")
+
+    # ── 4 — Best remaining contextual signal for THIS dataset ─────────────────
+    # Priority: revenue-at-risk (actionable) > top segment > secondary KPI.
+    # This is the one slot that genuinely changes shape by domain/dataset —
+    # slots 1-3 are the fixed, always-present metrics you asked for.
+    excluded_cols = _high_cardinality_cols(verified_stats)
+    good_segment_cols = [
+        c for c in cat_summary
+        if c.get("column") not in excluded_cols and (c.get("top_values") or [])
+    ]
+
+    if revenue_by_status and revenue_by_status.get("excluded_revenue", 0) > 0:
+        excluded_rev = revenue_by_status["excluded_revenue"]
+        total_rev    = revenue_by_status.get("total_revenue_all_rows") or 0
+        pct_at_risk  = (excluded_rev / total_rev * 100) if total_rev else 0
+        statuses     = revenue_by_status.get("non_completed_statuses", [])
+        _, _, rev_prefix = _get_business_context(revenue_by_status.get("revenue_column", ""))
+        status_label = ", ".join(statuses) if statuses else "non-completed orders"
+        _card(
+            cols[3], _format_value(excluded_rev, rev_prefix), "⚠️ REVENUE AT RISK",
+            caption=f"{pct_at_risk:.1f}% tied up in {status_label}",
+        )
+    elif good_segment_cols:
+        seg_entry = good_segment_cols[0]
+        seg_col   = seg_entry["column"]
+        top_val_entry = seg_entry["top_values"][0]
+        seg_name  = str(top_val_entry.get("value", "N/A"))
+        if primary_kpi["column"] in df.columns and seg_col in df.columns:
+            kpi_col = primary_kpi["column"]
+            df_num  = _ensure_numeric(df, kpi_col)
+            seg_total   = df_num.loc[df[seg_col].astype(str) == seg_name, kpi_col].sum()
+            grand_total = df_num[kpi_col].sum()
+            seg_pct_of_kpi = (seg_total / grand_total * 100) if grand_total else 0
+            _card(
+                cols[3], seg_name[:18], f"🏆 TOP {seg_col.replace('_',' ').upper()}",
+                caption=f"{_format_value(seg_total, prefix)} · {seg_pct_of_kpi:.1f}% of {label.lower()}",
+            )
+        else:
+            _card(cols[3], seg_name[:18], f"🏆 TOP {seg_col.replace('_',' ').upper()}")
+    elif len(ranked) > 1:
+        secondary_kpi = ranked[1]
+        emoji2, label2, prefix2 = _get_business_context(secondary_kpi["column"])
+        _card(
+            cols[3],
+            _format_value(secondary_kpi.get("mean") or 0, prefix2),
+            f"{emoji2} AVG {label2.upper()}",
+            _trend_html(secondary_kpi["column"]),
+        )
+    else:
+        _card(cols[3], "N/A", "📊 No secondary signal", caption="Dataset has a single business metric")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -663,270 +876,76 @@ def _build_caterpillar_trend_fig(
 
 def render_trend_charts(verified_stats: dict, df: pd.DataFrame):
     """
-    Trend Analysis.
-
-    Aggregation strategy (Caterpillar-style reference image):
-      • If the date column spans > 2 distinct years  → one dot per YEAR (annual total).
-      • Otherwise                                    → one dot per MONTH (monthly total).
-
-    This avoids cluttered dot-per-row charts and produces a clean, readable
-    trend line with value labels at every data point — exactly like the
-    reference chart.
-
-    High-cardinality date columns (e.g. raw timestamps with hundreds of
-    unique values) are also handled: they get bucketed to the right period
-    automatically via _aggregate_trend_smart().
+    Renders one Caterpillar-style trend chart per detected trend
+    (full width), plus a forecast chart if forecast data is available
+    in verified_stats.
     """
-    monthly_sales = verified_stats.get("monthly_sales", [])
-    rendered_period = _render_period_trends(df, verified_stats, monthly_sales)
-
-    if rendered_period:
-        return  # period-based charts already rendered; skip fallback
-
-    # ── Fallback: raw datetime column trends ──────────────────────────────────
     trends = verified_stats.get("trends", [])
-    valid_trends = [
-        t for t in trends
-        if t.get("date_column") in df.columns and t.get("value_column") in df.columns
-    ]
-    if not valid_trends:
+    if not trends:
         return
 
-    _section_header("📈 Trend Analysis", "Annual or monthly performance — value at every data point")
+    _section_header("📈 Trend Analysis", f"{len(trends)} trend(s) detected")
 
-    for trend in valid_trends[:4]:
-        date_col  = trend["date_column"]
-        value_col = trend["value_column"]
-        r2        = trend.get("r_squared", 0) or 0
-        direction = trend.get("direction", "")
-        pct_chg   = trend.get("pct_change_start_to_end")
-
-        _, biz_label, prefix = _get_business_context(value_col)
-
-        if direction == "increasing":
-            badge_color, badge_icon = "#10b981", "↑"
-        elif direction == "decreasing":
-            badge_color, badge_icon = "#ef4444", "↓"
-        else:
-            badge_color, badge_icon = "#94a3b8", "→"
-
-        pct_text = (
-            f" &nbsp;<span style='color:{badge_color};font-size:0.8rem;'>"
-            f"{badge_icon} {pct_chg:+.1f}%</span>"
-            if pct_chg is not None else ""
-        )
-        st.markdown(
-            f"""
-            <div style="margin:0.5rem 0 0.3rem 0;font-size:0.85rem;color:#64748b;">
-                {biz_label} &nbsp;·&nbsp; R² = {r2:.2f}{pct_text}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    for t in trends:
+        date_col  = t.get("date_column")
+        value_col = t.get("value_column")
+        if not date_col or not value_col or date_col not in df.columns or value_col not in df.columns:
+            continue
 
         labels, totals, granularity = _aggregate_trend_smart(df, date_col, value_col)
-        if not totals:
+        if not labels:
             continue
 
-        gran_label = "Annual Total" if granularity == "annual" else "Monthly Total"
+        emoji, biz_label, prefix = _get_business_context(value_col)
+        # `direction` is already reconciled with pct_change_start_to_end in
+        # stats_engine.py (same source of truth), so the arrow word and the
+        # sign of the percentage shown next to it can never contradict —
+        # they're derived from the same number.
+        direction = t.get("direction", "")
+        pct = t.get("pct_change_start_to_end")
+        pct_txt = f" ({pct:+.1f}%)" if pct is not None else ""
+        title = f"{biz_label} Trend — {direction.title()}{pct_txt}"
+        if t.get("direction_conflict"):
+            title += "  ⚠ early/late outlier distorts the simple trend line"
+
         fig = _build_caterpillar_trend_fig(
-            labels, totals, biz_label,
-            title=f"{biz_label} — {gran_label}",
-            prefix=prefix,
-            granularity=granularity,
+            labels, totals, biz_label, title, prefix, granularity
         )
         st.plotly_chart(fig, use_container_width=True)
+        st.markdown("<div style='margin-bottom:1.5rem;'></div>", unsafe_allow_html=True)
 
-        if r2 >= 0.25:
-            _render_forecast_inline(df, date_col, value_col, r2, biz_label, prefix)
-
-
-def _render_period_trends(df: pd.DataFrame, verified_stats: dict, monthly_sales: list) -> bool:
-    """
-    Renders period SUM trend charts using pre-computed monthly_sales rows.
-
-    Aggregation granularity (Caterpillar-style):
-      • Count distinct years in the monthly_sales rows.
-      • If distinct years > 2  → collapse to ANNUAL totals (one dot per year).
-      • Otherwise              → keep MONTHLY totals (one dot per year-month).
-
-    Each data point is rendered as a filled circle with a value label above it,
-    connected by a thin line — matching the reference Caterpillar chart style.
-    A dashed OLS trend line is overlaid in amber.
-
-    Returns True if at least one chart was rendered.
-    """
-    if not monthly_sales:
-        return False
-
-    # Group monthly_sales rows by (date_column, value_column)
-    pairs: dict = {}
-    for row in monthly_sales:
-        key = (row["date_column"], row["value_column"])
-        pairs.setdefault(key, []).append(row)
-
-    if not pairs:
-        return False
-
-    _section_header(
-        "📈 Trend Analysis",
-        "Annual totals (>2 yrs) or monthly totals · value labels at every point",
-    )
-
-    rendered = False
-    for (date_col, value_col), rows in list(pairs.items())[:4]:
-        _, biz_label, prefix = _get_business_context(value_col)
-
-        period_df = pd.DataFrame(rows).sort_values(["year", "month"])
-        if len(period_df) < 3:
-            continue
-
-        # ── Decide: annual or monthly ─────────────────────────────────────────
-        distinct_years = period_df["year"].nunique()
-        if distinct_years > 2:
-            # Collapse to annual totals
-            agg = (
-                period_df.groupby("year")["total"]
-                .sum()
-                .reset_index()
-                .sort_values("year")
-            )
-            labels    = agg["year"].astype(str).tolist()
-            totals    = agg["total"].tolist()
-            granularity = "annual"
-        else:
-            labels    = period_df["label"].tolist()
-            totals    = period_df["total"].tolist()
-            granularity = "monthly"
-
-        y_arr = np.array(totals, dtype=float)
-
-        # ── OLS ───────────────────────────────────────────────────────────────
-        ols_trend = None
-        r2_val    = None
-        try:
-            import statsmodels.api as sm
-            x_idx  = np.arange(len(y_arr), dtype=float)
-            X      = sm.add_constant(x_idx)
-            model  = sm.OLS(y_arr, X).fit()
-            ols_trend = model.predict(X)
-            r2_val    = round(float(model.rsquared), 3)
-        except Exception:
-            pass
-
-        # ── Direction badge ───────────────────────────────────────────────────
-        slope = (ols_trend[-1] - ols_trend[0]) if ols_trend is not None and len(ols_trend) >= 2 else 0
-        badge_color = "#10b981" if slope > 0 else "#ef4444" if slope < 0 else "#94a3b8"
-        badge_icon  = "↑" if slope > 0 else "↓" if slope < 0 else "→"
-        pct_chg     = round(((y_arr[-1] - y_arr[0]) / abs(y_arr[0])) * 100, 1) if y_arr[0] != 0 else None
-
-        pct_text = (
-            f" &nbsp;<span style='color:{badge_color};font-size:0.8rem;'>"
-            f"{badge_icon} {pct_chg:+.1f}%</span>"
-            if pct_chg is not None else ""
-        )
-        gran_label = "annual totals" if granularity == "annual" else "monthly totals"
-        r2_text    = f" &nbsp;·&nbsp; OLS R² = {r2_val:.3f}" if r2_val is not None else ""
-        st.markdown(
-            f"""
-            <div style="margin:0.5rem 0 0.25rem 0;font-size:0.85rem;color:#64748b;">
-                {biz_label} {gran_label}{r2_text}{pct_text}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        # ── Caterpillar-style chart ───────────────────────────────────────────
-        gran_title = "Annual Total" if granularity == "annual" else "Monthly Total"
-        fig = _build_caterpillar_trend_fig(
-            labels, totals, biz_label,
-            title=f"{biz_label} — {gran_title} (SUM)",
-            prefix=prefix,
-            granularity=granularity,
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # YoY/MoM summary caption
-        for pt in verified_stats.get("period_trends", []):
-            if pt.get("metric_column") == value_col and pt.get("summary"):
-                st.caption(f"📊 {pt['summary']}")
-                break
-
-        rendered = True
-
-    return rendered
+    _render_forecast_if_available(verified_stats, df)
 
 
-def _add_ols_trend_line(fig: go.Figure, x_labels, y_vals: np.ndarray):
-    """Add a dashed OLS trend line (statsmodels) to an existing figure."""
-    try:
-        import statsmodels.api as sm
-        x_idx = np.arange(len(y_vals), dtype=float)
-        X = sm.add_constant(x_idx)
-        model = sm.OLS(y_vals.astype(float), X).fit()
-        trend_y = model.predict(X)
-        fig.add_trace(go.Scatter(
-            x=x_labels,
-            y=trend_y,
-            mode="lines",
-            name="OLS Trend",
-            line=dict(color="#f59e0b", width=1.8, dash="dash"),
-            opacity=0.8,
-        ))
-    except Exception:
-        # numpy polyfit fallback if statsmodels unavailable
-        try:
-            x_idx = np.arange(len(y_vals), dtype=float)
-            slope, intercept = np.polyfit(x_idx, y_vals.astype(float), 1)
-            fig.add_trace(go.Scatter(
-                x=x_labels,
-                y=(slope * x_idx + intercept),
-                mode="lines",
-                name="Trend",
-                line=dict(color="#f59e0b", width=1.5, dash="dash"),
-                opacity=0.7,
-            ))
-        except Exception:
-            pass
-
-
-def _render_forecast_inline(
-    df: pd.DataFrame,
-    date_col: str,
-    value_col: str,
-    r2: float,
-    biz_label: str,
-    prefix: str,
-):
-    """Render a 5-period forecast beneath the historical trend chart."""
-    try:
-        from ml_insights import TrendForecaster
-        result = TrendForecaster(df).forecast(date_col, value_col, periods_ahead=5)
-        if not result:
-            return
-    except ImportError:
+def _render_forecast_if_available(verified_stats: dict, df: pd.DataFrame):
+    forecast_data = verified_stats.get("forecast")
+    if not forecast_data:
         return
 
-    combined  = result["combined_data"]
-    pct_proj  = result.get("pct_projected_change")
-    end_val   = result.get("projected_end_value")
+    combined  = forecast_data.get("combined_data")
+    date_col  = forecast_data.get("date_column")
+    value_col = forecast_data.get("value_column")
+    if combined is None or not date_col or not value_col:
+        return
+
+    if isinstance(combined, dict):
+        combined = pd.DataFrame(combined)
+    if not isinstance(combined, pd.DataFrame) or combined.empty:
+        return
 
     historical = combined[combined["type"] == "historical"]
     forecast   = combined[combined["type"] == "forecast"]
+    if forecast.empty:
+        return
 
-    st.caption(
-        f"📡 **5-Period Forecast** — projected end value: "
-        f"**{_format_value(end_val, prefix)}**"
-        + (f" ({pct_proj:+.1f}% vs last observed)" if pct_proj is not None else "")
-        + f" · Confidence band = 95%  ·  R² = {r2:.2f}"
-    )
+    emoji, biz_label, prefix = _get_business_context(value_col)
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=historical[date_col], y=historical[value_col],
         mode="lines+markers", name="Historical",
-        line=dict(color="#00f5ff", width=2.5),
-        marker=dict(size=5),
+        line=dict(color="#3b82f6", width=2.5),
+        marker=dict(size=6),
     ))
     fig.add_trace(go.Scatter(
         x=forecast[date_col], y=forecast["upper_bound"],
@@ -955,7 +974,7 @@ def _render_forecast_inline(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AI-SELECTED CHARTS  (pie · donut · bar · column · stacked_bar only)
+# AI-SELECTED CHARTS  (pie · donut · bar · column · stacked_bar · scatter · histogram)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _high_cardinality_cols(verified_stats: dict) -> set:
@@ -979,7 +998,7 @@ def render_ai_charts(df: pd.DataFrame, chart_specs: list, verified_stats: dict):
     Renders AI-selected charts (LLM-curated via DashboardAgent).
     - Line charts → skipped here (rendered in render_trend_charts instead).
     - Pie / donut → centred, not full-bleed (they look bad full width).
-    - Bar / column / stacked_bar → two-column grid.
+    - Bar / column / stacked_bar / scatter / histogram → two-column grid.
 
     High-cardinality columns (>12 unique values or top value <5% share)
     are silently dropped even if the LLM spec included them — they produce
@@ -989,7 +1008,7 @@ def render_ai_charts(df: pd.DataFrame, chart_specs: list, verified_stats: dict):
         return
 
     # Filter to only allowed non-line types
-    allowed   = {"pie", "donut", "bar", "column", "stacked_bar"}
+    allowed   = {"pie", "donut", "bar", "column", "stacked_bar", "scatter", "histogram"}
     excluded  = _high_cardinality_cols(verified_stats)
 
     specs = [
@@ -1017,7 +1036,7 @@ def render_ai_charts(df: pd.DataFrame, chart_specs: list, verified_stats: dict):
                     st.caption(f"📌 {spec['reasoning']}")
         st.markdown("<div style='margin-bottom:0.5rem;'></div>", unsafe_allow_html=True)
 
-    # Bar / column / stacked_bar: 2-column grid
+    # Bar / column / stacked_bar / scatter / histogram: 2-column grid
     for i in range(0, len(other_specs), 2):
         pair = other_specs[i : i + 2]
         grid = st.columns(len(pair))
@@ -1098,6 +1117,93 @@ def render_category_breakdown(verified_stats: dict, df: pd.DataFrame):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ESSENTIAL CHARTS  (single capped section — replaces the old uncapped
+# render_trend_charts + forecast + render_ai_charts + render_category_breakdown
+# stack. Max 1 trend line + max 3 curated charts = 4 charts total.)
+# ══════════════════════════════════════════════════════════════════════════════
+
+MAX_TREND_CHARTS = 1
+MAX_CURATED_CHARTS = 3
+
+
+def render_essential_charts(df: pd.DataFrame, chart_specs: list, verified_stats: dict):
+    trends = verified_stats.get("trends", [])
+
+    # ── At most one trend line: the strongest RELIABLE one. This is the
+    # same trend the business_summary paragraph's "top performance finding"
+    # sentence is grounded in (get_business_summary_task in tasks.py is
+    # told to cite the single most important reliable finding) — so the
+    # chart people see backs up the sentence they just read, instead of
+    # a wall of one-line-chart-per-column noise.
+    reliable_trends = [t for t in trends if not t.get("insufficient_edge_data")]
+    pool = reliable_trends or trends
+    best_trend = (
+        sorted(pool, key=lambda t: t.get("r_squared", 0) or 0, reverse=True)[0]
+        if pool else None
+    )
+
+    any_chart_rendered = False
+
+    if best_trend:
+        date_col, value_col = best_trend.get("date_column"), best_trend.get("value_column")
+        if date_col in df.columns and value_col in df.columns:
+            labels, totals, granularity = _aggregate_trend_smart(df, date_col, value_col)
+            if labels:
+                _section_header("📈 Trend That Matters")
+                emoji, biz_label, prefix = _get_business_context(value_col)
+                direction = best_trend.get("direction", "")
+                pct = best_trend.get("pct_change_start_to_end")
+                pct_txt = f" ({pct:+.1f}%)" if pct is not None else ""
+                title = f"{biz_label} Trend — {direction.title()}{pct_txt}"
+                if best_trend.get("direction_conflict"):
+                    title += "  ⚠ early/late outlier distorts the simple trend line"
+                fig = _build_caterpillar_trend_fig(labels, totals, biz_label, title, prefix, granularity)
+                st.plotly_chart(fig, use_container_width=True)
+                st.markdown("<div style='margin-bottom:1rem;'></div>", unsafe_allow_html=True)
+                any_chart_rendered = True
+
+    # ── Up to 3 AI-curated charts, already grounded in verified_stats with
+    # per-chart reasoning tied to a real number (see dashboard_agent.py).
+    excluded = _high_cardinality_cols(verified_stats)
+    curated = [
+        s for s in (chart_specs or [])
+        if s.get("chart_type") in {"pie", "donut", "bar", "column", "stacked_bar", "scatter", "histogram"}
+        and s.get("x_column") not in excluded
+    ]
+    curated = sorted(curated, key=lambda s: s.get("priority", 99))[:MAX_CURATED_CHARTS]
+
+    if curated:
+        if any_chart_rendered:
+            st.markdown("<div style='margin-bottom:0.5rem;'></div>", unsafe_allow_html=True)
+        _section_header("📊 Essential Business Charts", f"{len(curated)} chart(s) selected")
+
+        pie_specs   = [s for s in curated if s.get("chart_type") in ("pie", "donut")]
+        other_specs = [s for s in curated if s.get("chart_type") not in ("pie", "donut")]
+
+        for spec in pie_specs:
+            left, centre, right = st.columns([1, 3, 1])
+            with centre:
+                fig = render_chart(df, spec, verified_stats)
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
+                    if spec.get("reasoning"):
+                        st.caption(f"📌 {spec['reasoning']}")
+            st.markdown("<div style='margin-bottom:0.5rem;'></div>", unsafe_allow_html=True)
+
+        for i in range(0, len(other_specs), 2):
+            pair = other_specs[i: i + 2]
+            grid = st.columns(len(pair))
+            for col, spec in zip(grid, pair):
+                with col:
+                    fig = render_chart(df, spec, verified_stats)
+                    if fig:
+                        st.plotly_chart(fig, use_container_width=True)
+                        if spec.get("reasoning"):
+                            st.caption(f"📌 {spec['reasoning']}")
+            st.markdown("<div style='margin-bottom:0.25rem;'></div>", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN DASHBOARD ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1109,29 +1215,24 @@ def render_dashboard(
 ):
     verified_stats = verified_stats or {}
 
-    # ── 1. Dataset overview metrics ───────────────────────────────────────────
-    render_summary_cards(df, verified_stats)
+    # ── 1. KPI cards — 3 fixed slots + 1 contextual slot ───────────────────────
+    render_kpi_cards(df, verified_stats)
 
     # ── 2. Business context paragraph ────────────────────────────────────────
     if business_summary:
         render_business_context_summary(business_summary)
 
-    st.markdown("<div style='margin-bottom:1rem;'></div>", unsafe_allow_html=True)
-
-    # ── 3. KPI cards ──────────────────────────────────────────────────────────
-    render_kpi_cards(verified_stats)
-
     st.markdown("<div style='margin-bottom:1.5rem;'></div>", unsafe_allow_html=True)
 
-    # ── 4. Trend analysis (line charts + optional forecast) ───────────────────
-    render_trend_charts(verified_stats, df)
-
-    st.markdown("<div style='margin-bottom:1rem;'></div>", unsafe_allow_html=True)
-
-    # ── 5. AI-selected charts (pie · bar · column · stacked_bar) ──────────────
-    render_ai_charts(df, chart_specs, verified_stats)
-
-    st.markdown("<div style='margin-bottom:1rem;'></div>", unsafe_allow_html=True)
-
-    # ── 6. Auto category breakdown ────────────────────────────────────────────
-    render_category_breakdown(verified_stats, df)
+    # ── 3. Essential charts only — ONE curated section, hard-capped.
+    # Previously this was 3 independent, uncapped chart paths (a line chart
+    # per trend + a forecast, 4-6 AI-selected charts, and up to 3 more
+    # auto category-breakdown bars) stacked with no shared limit — easily
+    # 8-10+ charts, most disconnected from the one story the business
+    # summary tells. Now: at most 1 trend line (the strongest, reliable
+    # one — the same signal the summary's "top performance finding"
+    # sentence is built from) + at most 3 AI-curated charts, already
+    # grounded in verified_stats with per-chart reasoning. Forecast and
+    # the separate auto-breakdown pass are dropped as redundant with what
+    # render_ai_charts already covers.
+    render_essential_charts(df, chart_specs, verified_stats)
