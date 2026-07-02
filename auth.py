@@ -193,12 +193,31 @@ div[data-testid="so-trigger"] > div > button:hover {
 # ---------------------------------------------------------------------------
 
 def load_config():
-    with open(CONFIG_PATH) as f:
-        return yaml.load(f, Loader=SafeLoader)
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH) as f:
+            return yaml.load(f, Loader=SafeLoader)
+    # Running on Streamlit Cloud — no local config.yaml, use secrets instead
+    return {
+        "cookie": dict(st.secrets["cookie"]),
+        "credentials": {
+            "usernames": {
+                user: dict(data)
+                for user, data in st.secrets["credentials"]["usernames"].items()
+            }
+        },
+        "preauthorized": {"emails": list(st.secrets.get("preauthorized", {}).get("emails", []))},
+    }
 
 def save_config(cfg):
-    with open(CONFIG_PATH, "w") as f:
-        yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+    if os.path.exists(CONFIG_PATH) or os.path.dirname(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "w") as f:
+                yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+            return
+        except Exception:
+            pass
+    # On Cloud this won't persist across restarts — warn instead of failing silently
+    st.warning("Note: new accounts aren't saved permanently on this deployment.")
 
 def verify_password(plain, hashed):
     try:
