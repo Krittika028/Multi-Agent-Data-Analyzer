@@ -5,3 +5,7 @@ config.toml
 __pycache__/
 *.pyc
 chroma_db/
+venv/
+.streamlit/secrets.toml
+__pycache__/
+.DS_Store
