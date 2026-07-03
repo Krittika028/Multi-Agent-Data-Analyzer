@@ -43,7 +43,8 @@ NULL_STRINGS = {
     "missing", "Missing", "MISSING", "not available", "Not Available",
     "n.a", "N.A", "n.a.", "N.A.", "#N/A", "#NA", "TBD", "tbd", "TBC", "tbc",
     "N/A.", "n/a.", "NOT APPLICABLE", "not applicable", "N.A", "NA.", "n/a -",
-    "not provided", "Not Provided", "NOT PROVIDED", "N/P", "n/p",
+    "not provided", "Not Provided", "NOT PROVIDED", "N/P", "n/p", "ERROR", 
+    "error", "Error"
 }
 
 MONTH_MAP = {
