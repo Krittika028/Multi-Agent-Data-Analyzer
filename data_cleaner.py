@@ -13,16 +13,24 @@ Fixes vs previous version:
      (both more precise and unambiguous for charting/sorting)
   4. Fuzzy threshold uses relative edit-distance so short words are never over-merged
      and longer typo-words (Italian/Italain) always merge correctly
-  5. NEW — step4_remove_duplicates no longer collapses rows with a MISSING id
-     into "duplicates of each other". Previously, drop_duplicates(subset=[id_col])
-     treats every NaN in that column as equal, so N rows with a genuinely missing
-     ID (not yet imputed at this point in the pipeline) got reported/removed as
-     N-1 duplicates even though they're N different, real orders. Rows with a
-     null id are now excluded from id-based dedup entirely and left for
-     imputation later. A separate, always-run full-row-duplicate check (the
-     same definition a raw "duplicate rows" stat pill would use) now runs
-     alongside it, so the id-based count and the true full-row-duplicate count
-     are both reported explicitly and can never silently disagree again.
+  5. step4_remove_duplicates no longer collapses rows with a MISSING id into
+     "duplicates of each other" — rows with a null id are excluded from
+     id-based dedup and a separate full-row-duplicate pass always runs too.
+  6. NEW — NULL_STRINGS restored to the full error/invalid variant set
+     (ERR/err/Err, #ERROR!, invalid, corrupt, void, etc.), with a
+     module-level precomputed lowercase set (_NULL_STRINGS_LOWER) instead
+     of rebuilding it inside step2 on every call.
+  7. NEW — _sweep_nulls_again() runs after step7. NOTE on why: step2 already
+     does a case-insensitive NULL_STRINGS check, so ordinary case variants
+     ("error"/"ERROR"/"Error") are already gone before step7 runs — Title
+     Casing in step7 is NOT what this guards against. What it DOES guard
+     against: step7's Phase 3 LLM canonical mapping can map some dirty
+     value to a string like "N/A" or "Unknown" as its chosen "canonical"
+     label. That string is introduced AFTER step2 already ran, so without
+     this sweep it would sail into step9 as a real category. This is a
+     genuine but LLM-dependent risk — it has not been confirmed to occur
+     in practice, only reasoned about. Test with a case where the LLM
+     actually produces a null-marker string before trusting this blindly.
 """
 
 import pandas as pd
@@ -37,15 +45,31 @@ import re
 import unicodedata
 
 NULL_STRINGS = {
+    # Standard null representations
     "None", "none", "NONE", "NULL", "null", "nan", "NaN", "NAN",
     "NA", "N/A", "n/a", "na", "N/a", "", " ", "-", "--", "?",
+    # Unknown / undefined
     "unknown", "Unknown", "UNKNOWN", "undefined", "Undefined", "nil", "Nil",
+    # Missing
     "missing", "Missing", "MISSING", "not available", "Not Available",
+    # Abbreviation variants
     "n.a", "N.A", "n.a.", "N.A.", "#N/A", "#NA", "TBD", "tbd", "TBC", "tbc",
-    "N/A.", "n/a.", "NOT APPLICABLE", "not applicable", "N.A", "NA.", "n/a -",
-    "not provided", "Not Provided", "NOT PROVIDED", "N/P", "n/p", "ERROR", 
-    "error", "Error"
+    "N/A.", "n/a.", "NOT APPLICABLE", "not applicable", "NA.", "n/a -",
+    # Not provided
+    "not provided", "Not Provided", "NOT PROVIDED", "N/P", "n/p",
+    # ERROR variants — real-world data-entry / system errors
+    "ERROR", "error", "Error", "ERR", "err", "Err",
+    "#ERROR", "#ERROR!", "#VALUE!", "#REF!", "#DIV/0!", "#NAME?", "#NUM!", "#NULL!",
+    # Other invalid markers
+    "invalid", "Invalid", "INVALID",
+    "corrupt", "Corrupt", "CORRUPT",
+    "bad", "BAD",
+    "void", "Void", "VOID",
 }
+
+# Precomputed once at module load — avoid rebuilding this set on every
+# step2/sweep call across every column.
+_NULL_STRINGS_LOWER = {s.lower().strip() for s in NULL_STRINGS}
 
 MONTH_MAP = {
     'january': 1, 'february': 2, 'march': 3, 'april': 4,
@@ -208,8 +232,7 @@ def _clean_numeric_string(series: pd.Series) -> pd.Series:
     """
     s = series.astype(str).str.strip()
 
-    null_lower = {t.lower() for t in NULL_STRINGS}
-    s = s.where(~s.str.lower().isin(null_lower), np.nan)
+    s = s.where(~s.str.lower().isin(_NULL_STRINGS_LOWER), np.nan)
 
     s = s.str.replace(r'^\((.*)\)$', r'-\1', regex=True)         # (123.45) -> -123.45
     s = s.str.replace(r'[₹$€£¥₩,%\s]', '', regex=True)           # currency/commas/%/spaces
@@ -430,7 +453,6 @@ class DataCleaner:
     # ── STEP 2: Convert null-like strings → NaN ───────────────────────────────
     def step2_convert_nulls_to_nan(self):
         total = 0
-        null_lower = {s.lower().strip() for s in NULL_STRINGS}
         for col in self.df.columns:
             new_col = []
             count   = 0
@@ -440,7 +462,7 @@ class DataCleaner:
                 elif isinstance(val, float) and np.isnan(val):
                     new_col.append(np.nan)
                 elif isinstance(val, str) and (
-                    val.strip() in NULL_STRINGS or val.strip().lower() in null_lower
+                    val.strip() in NULL_STRINGS or val.strip().lower() in _NULL_STRINGS_LOWER
                 ):
                     new_col.append(np.nan); count += 1
                 else:
@@ -787,7 +809,11 @@ Your task:
    spacing variants, case variants, boolean variants.
 4. Every canonical value MUST be in Title Case.
 5. If NOT confident, map value to itself (Title Cased).
-6. Return ONLY a valid JSON object. No explanation, no markdown.
+6. Do NOT map any value to a null/placeholder-style label such as
+   "N/A", "Unknown", "None", "Missing", "Error", "Invalid" or similar —
+   if a value is genuinely ambiguous, map it to itself (Title Cased)
+   instead of inventing a placeholder category.
+7. Return ONLY a valid JSON object. No explanation, no markdown.
    Format: {{"dirty_value": "Canonical Value", ...}}
    Every key must be an exact match for a value in the input list."""
 
@@ -958,6 +984,55 @@ Your task:
 
         if fixed == 0:
             self.report.append(f"[CATEGORICAL] ✔ All text/categorical columns already clean")
+
+    # ── NULL SWEEP: re-run after step7 canonicalization ────────────────────────
+    def _sweep_nulls_again(self):
+        """
+        Second null-string -> NaN pass, run after step7.
+
+        This is NOT guarding against Title-Case turning a case-variant into
+        something that escapes NULL_STRINGS — step2 already does a
+        case-insensitive check, so that specific failure mode does not
+        exist in this pipeline.
+
+        What this DOES guard against: step7 Phase 3's LLM canonical mapping
+        can, in principle, map some dirty value to a placeholder-style
+        label (e.g. "Unknown", "N/A") as its chosen "canonical" category.
+        Because that string is introduced AFTER step2 already ran, it would
+        otherwise sail into step9 as a real category never flagged as
+        missing. The Phase 3 prompt now explicitly forbids the LLM from
+        doing this, so ideally this sweep finds nothing — but relying on a
+        prompt instruction alone is not a guarantee, hence this pass as a
+        backstop. This has not been confirmed to trigger in practice; treat
+        it as an untested safety net, not a verified fix.
+        """
+        pre_missing = int(self.df.isnull().sum().sum())
+        total = 0
+        for col in self.df.columns:
+            if pd.api.types.is_numeric_dtype(self.df[col]) or pd.api.types.is_datetime64_any_dtype(self.df[col]):
+                continue  # numeric columns already get this treatment in step12
+            new_col = []
+            count   = 0
+            for val in self.df[col]:
+                if val is None or (isinstance(val, float) and np.isnan(val)):
+                    new_col.append(np.nan)
+                elif isinstance(val, str) and (
+                    val.strip() in NULL_STRINGS or val.strip().lower() in _NULL_STRINGS_LOWER
+                ):
+                    new_col.append(np.nan); count += 1
+                else:
+                    new_col.append(val)
+            self.df[col] = new_col
+            total += count
+        if total > 0:
+            post_missing = int(self.df.isnull().sum().sum())
+            self.report.append(
+                f"[NULL SWEEP 2] ✅ {total} additional null-string value(s) caught after "
+                f"categorical standardisation → NaN (total missing: {pre_missing} → {post_missing})"
+            )
+            self.fixes_applied.append(f"Post-standardisation null sweep: {total} additional value(s) → NaN")
+        else:
+            self.report.append("[NULL SWEEP 2] ✔ No additional null strings found after categorical standardisation")
 
     # ── STEP 8: Fix corrupted IDs ──────────────────────────────────────────────
     def step8_fix_corrupted_ids(self):
@@ -1272,6 +1347,7 @@ Your task:
         self.step6_fix_data_types()
         self.step6b_split_dates()
         self.step7_standardize_categoricals()
+        self._sweep_nulls_again()
         self.step12_final_dtype_audit()
         self.step8_fix_corrupted_ids()
         self.step9_rf_impute_missing()
