@@ -1,0 +1,4 @@
+https://multi-agent-data-analyzer.streamlit.app
+
+5k records taken - 3min 15secs to clean and generate business report
+1.5L records taken - 7 mins to upload itself. 2mins and 50secs to clean and generate business report

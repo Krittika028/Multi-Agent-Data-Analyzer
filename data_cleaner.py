@@ -16,21 +16,55 @@ Fixes vs previous version:
   5. step4_remove_duplicates no longer collapses rows with a MISSING id into
      "duplicates of each other" — rows with a null id are excluded from
      id-based dedup and a separate full-row-duplicate pass always runs too.
-  6. NEW — NULL_STRINGS restored to the full error/invalid variant set
+  6. NULL_STRINGS restored to the full error/invalid variant set
      (ERR/err/Err, #ERROR!, invalid, corrupt, void, etc.), with a
      module-level precomputed lowercase set (_NULL_STRINGS_LOWER) instead
      of rebuilding it inside step2 on every call.
-  7. NEW — _sweep_nulls_again() runs after step7. NOTE on why: step2 already
-     does a case-insensitive NULL_STRINGS check, so ordinary case variants
-     ("error"/"ERROR"/"Error") are already gone before step7 runs — Title
-     Casing in step7 is NOT what this guards against. What it DOES guard
-     against: step7's Phase 3 LLM canonical mapping can map some dirty
-     value to a string like "N/A" or "Unknown" as its chosen "canonical"
-     label. That string is introduced AFTER step2 already ran, so without
-     this sweep it would sail into step9 as a real category. This is a
-     genuine but LLM-dependent risk — it has not been confirmed to occur
-     in practice, only reasoned about. Test with a case where the LLM
-     actually produces a null-marker string before trusting this blindly.
+  7. _sweep_nulls_again() runs after step7 as a backstop against the LLM
+     canonical mapping introducing a placeholder-style label post-step2.
+
+--------------------------------------------------------------------
+CRITICAL FIX (this version) — ROW-LOSS BUG:
+
+step4_remove_duplicates previously trusted ANY column ending in "_id"
+(or literally named "id") as a safe deduplication key, without ever
+verifying that column was actually close to unique. On a dataset where
+an id-like column repeats across genuinely distinct rows (e.g. a
+replicated/synthetic file, or an id that isn't a true primary key),
+this caused MASSIVE, SILENT data loss — a real production run went
+from 150,000 rows to 1,500 rows (99% of rows discarded) because
+`order_id` was not unique in that file, and the pipeline treated every
+repeat as "the same order."
+
+Fix — a two-stage safety gate, both independent of each other:
+  1. UNIQUENESS GATE: an _id column is only trusted as a dedup key if
+     it was >= 95% unique BEFORE any cleaning touched it. Below that,
+     id-based dedup is skipped entirely and only full-row dedup runs.
+  2. REMOVAL-SIZE GATE: even if the column passes gate 1, if id-based
+     dedup would still remove more than 30% of rows, that is treated
+     as a red flag (ID collision, not real duplication) and the
+     id-based removal is aborted — full-row dedup still runs on top.
+Every skip/abort is logged explicitly and loudly (not folded into a
+routine cleaning log line) so it can never again pass silently into
+downstream KPIs, dashboards, or the business report.
+--------------------------------------------------------------------
+PERFORMANCE FIXES (this version):
+
+  - step2_convert_nulls_to_nan and _sweep_nulls_again were rewritten
+    from per-cell Python `for val in series:` loops to vectorized
+    pandas string/boolean operations. At 150K rows x 17 columns this
+    was ~2.5M Python-level iterations before any real work happened —
+    now it's vectorized C-level pandas ops.
+  - step7's fuzzy near-duplicate merge (_build_canonical_map) is
+    O(n^2) in the number of UNIQUE categorical values. A cap
+    (_MAX_FUZZY_UNIQUE_VALUES) now skips fuzzy merging (Title Case
+    still applied) above that threshold, so one noisy high-cardinality
+    column can't blow up total cleaning time.
+  - step9 RF imputation now caps training rows per model fit
+    (MAX_RF_TRAIN_ROWS) via random sampling, so a 150-tree RF fit
+    on a 150K-row column costs roughly the same as on a capped sample,
+    without materially hurting imputation quality.
+--------------------------------------------------------------------
 """
 
 import pandas as pd
@@ -102,6 +136,16 @@ _RATING_MIN, _RATING_MAX = 1.0, 5.0
 _PERCENT_KEYWORDS = ['percent', 'pct', 'rate', 'discount', 'margin', 'utilization']
 _PERCENT_MIN, _PERCENT_MAX = 0.0, 100.0
 
+# ── Row-loss safety thresholds for id-based dedup ──────────────────────────────
+_MIN_ID_UNIQUENESS_FOR_DEDUP = 0.95   # id column must be this unique pre-clean to be trusted
+_MAX_SAFE_ID_REMOVAL_PCT     = 0.30   # abort id-based dedup if it would remove more than this
+
+# ── Fuzzy dedup performance cap ─────────────────────────────────────────────────
+_MAX_FUZZY_UNIQUE_VALUES = 500   # above this, skip pairwise edit-distance merge (too slow to be worth it)
+
+# ── RF imputation performance cap ───────────────────────────────────────────────
+_MAX_RF_TRAIN_ROWS = 20_000      # sample down to this many rows per column fit on large datasets
+
 
 # ── Fuzzy near-duplicate merging ───────────────────────────────────────────────
 
@@ -137,6 +181,9 @@ def _build_canonical_map(values: list, max_edit_dist: int = 2) -> dict:
     Uses BOTH absolute edit distance AND relative distance to avoid
     merging short distinct words (e.g. 'Cat' vs 'Car') while still
     catching longer typos ('Italain' → 'Italian', 'Bangalroe' → 'Bangalore').
+
+    NOTE: O(n^2) in len(values) — callers should gate this behind
+    _MAX_FUZZY_UNIQUE_VALUES for large datasets (see step7).
     """
     freq = pd.Series(values).value_counts()
     sorted_vals = freq.index.tolist()
@@ -418,6 +465,10 @@ class DataCleaner:
         self._llm_dtypes    = {}
         # Track which columns came from imputation (for post-clip)
         self._imputed_cols  = set()
+        # Row-retention bookkeeping — surfaced to crew.py for the
+        # independent reporting-layer tripwire (see tasks.py).
+        self.rows_before_dedup = None
+        self.rows_after_dedup  = None
 
     # ── STEP 0: Drop user-selected columns ────────────────────────────────────
     def step0_drop_columns(self, columns_to_drop):
@@ -450,24 +501,25 @@ class DataCleaner:
         else:
             self.report.append(f"[COLUMNS] ✔ All {len(self.df.columns)} column names are clean")
 
-    # ── STEP 2: Convert null-like strings → NaN ───────────────────────────────
+    # ── STEP 2: Convert null-like strings → NaN (VECTORIZED) ──────────────────
     def step2_convert_nulls_to_nan(self):
+        """
+        Vectorized replacement of the previous per-cell Python loop.
+        At 150K rows x 17 columns the old `for val in series:` approach
+        meant ~2.5M Python-level iterations before any real work started.
+        This does the equivalent check as a single vectorized pandas
+        string/boolean operation per column.
+        """
         total = 0
         for col in self.df.columns:
-            new_col = []
-            count   = 0
-            for val in self.df[col]:
-                if val is None:
-                    new_col.append(np.nan); count += 1
-                elif isinstance(val, float) and np.isnan(val):
-                    new_col.append(np.nan)
-                elif isinstance(val, str) and (
-                    val.strip() in NULL_STRINGS or val.strip().lower() in _NULL_STRINGS_LOWER
-                ):
-                    new_col.append(np.nan); count += 1
-                else:
-                    new_col.append(val)
-            self.df[col] = new_col
+            s = self.df[col]
+            if pd.api.types.is_numeric_dtype(s) or pd.api.types.is_datetime64_any_dtype(s):
+                continue  # can't contain null-marker strings
+            str_s = s.astype(str).str.strip()
+            mask = str_s.str.lower().isin(_NULL_STRINGS_LOWER) & s.notna()
+            count = int(mask.sum())
+            if count:
+                self.df.loc[mask, col] = np.nan
             total += count
         if total > 0:
             self.report.append(f"[NULL STRINGS] ✅ {total} null-string cells converted to NaN")
@@ -490,62 +542,95 @@ class DataCleaner:
         else:
             self.report.append(f"[MISSING] ✔ No missing values found")
 
-    # ── STEP 4: Remove duplicates (FIXED) ──────────────────────────────────────
+    # ── STEP 4: Remove duplicates (CRITICAL FIX: uniqueness + removal-size gates) ──
     def step4_remove_duplicates(self):
         """
-        FIXED: previously, when an id_col was found, this ran
-        drop_duplicates(subset=[id_col]) over the WHOLE dataframe — including
-        rows where id_col was still NaN at this point in the pipeline (before
-        imputation). Pandas treats every NaN as equal to every other NaN in
-        a dedup comparison, so N rows with a genuinely missing ID were
-        reported/removed as N-1 "duplicates" even though they're N different,
-        real records. That's exactly the "says 45 dups but removed 89 rows"
-        symptom — the true full-row-duplicate count (45) and the id-column
-        dedup count inflated by NaN collisions (89) disagreed silently.
+        FIXED — two independent safety gates before any id-based dedup runs:
 
-        Fix: rows with a missing id are now EXCLUDED from id-based dedup —
-        they're left alone here and handled later by imputation, not treated
-        as duplicates of each other. A separate, always-run, definition-
-        consistent full-row-duplicate pass then runs on top, using the exact
-        same logic a raw "duplicate rows" stat display would use, so the two
-        numbers can never contradict each other again.
+          GATE 1 (uniqueness): an *_id column is only trusted as a dedup
+          key if it was >= _MIN_ID_UNIQUENESS_FOR_DEDUP unique BEFORE any
+          cleaning touched it. A repeating id (e.g. a replicated/synthetic
+          file where order_id is not a true primary key) previously caused
+          rows to be silently collapsed as "duplicates" when they were
+          genuinely distinct records — this is the exact bug that took a
+          150,000-row dataset down to 1,500 rows.
+
+          GATE 2 (removal size): even if gate 1 passes, if id-based dedup
+          would still remove more than _MAX_SAFE_ID_REMOVAL_PCT of rows,
+          that is treated as an ID-collision red flag rather than real
+          duplication, and the id-based removal is aborted.
+
+        A separate, always-run, definition-consistent full-row-duplicate
+        pass runs afterward regardless — using the exact same logic a raw
+        "duplicate rows" stat display would use, so the two numbers can
+        never silently disagree.
         """
         before = len(self.df)
-        id_col = next((c for c in self.df.columns if c.endswith('_id') or c == 'id'), None)
+        self.rows_before_dedup = before
 
+        id_col = next((c for c in self.df.columns if c.endswith('_id') or c == 'id'), None)
         id_dupes_removed = 0
 
         if id_col:
-            null_id_mask = self.df[id_col].isna()
-            n_null_ids   = int(null_id_mask.sum())
+            non_null_ids = self.df[id_col].dropna()
+            uniqueness_ratio = (
+                non_null_ids.nunique() / len(non_null_ids) if len(non_null_ids) else 0
+            )
 
-            non_null_part = self.df[~null_id_mask]
-            null_part     = self.df[null_id_mask]
-
-            deduped_non_null = non_null_part.drop_duplicates(subset=[id_col])
-            id_dupes_removed = len(non_null_part) - len(deduped_non_null)
-
-            # Recombine — rows with a missing id are NEVER dropped here,
-            # regardless of how many other rows also happen to be missing
-            # that same id. Preserve original row order.
-            self.df = pd.concat([deduped_non_null, null_part]).sort_index()
-
-            if id_dupes_removed > 0:
+            if uniqueness_ratio < _MIN_ID_UNIQUENESS_FOR_DEDUP:
                 self.report.append(
-                    f"[DUPLICATES] ✅ {id_dupes_removed} duplicate '{id_col}' rows removed "
-                    f"(rows with a genuinely repeated, non-null '{id_col}' value)"
+                    f"[DUPLICATES] ⚠ '{id_col}' is only {uniqueness_ratio:.1%} unique "
+                    f"pre-clean — NOT trusted as a dedup key (would silently discard "
+                    f"legitimate rows). Skipping id-based dedup; running full-row "
+                    f"dedup only."
                 )
-                self.issues_found.append(f"{id_dupes_removed} id-based duplicates")
-                self.fixes_applied.append(f"Removed {id_dupes_removed} duplicate '{id_col}' rows")
             else:
-                self.report.append(f"[DUPLICATES] ✔ No duplicates found on non-null '{id_col}' values")
+                null_id_mask = self.df[id_col].isna()
+                n_null_ids   = int(null_id_mask.sum())
 
-            if n_null_ids > 0:
-                self.report.append(
-                    f"[DUPLICATES] ℹ {n_null_ids} row(s) have a missing '{id_col}' — "
-                    f"these are NOT treated as duplicates of each other (a shared missing "
-                    f"ID isn't evidence of a real duplicate); they'll be imputed later"
+                non_null_part = self.df[~null_id_mask]
+                null_part     = self.df[null_id_mask]
+
+                deduped_non_null = non_null_part.drop_duplicates(subset=[id_col])
+                id_dupes_removed  = len(non_null_part) - len(deduped_non_null)
+                removal_pct = (
+                    id_dupes_removed / len(non_null_part) if len(non_null_part) else 0
                 )
+
+                if removal_pct > _MAX_SAFE_ID_REMOVAL_PCT:
+                    self.report.append(
+                        f"[DUPLICATES] 🛑 id-based dedup on '{id_col}' would remove "
+                        f"{removal_pct:.1%} of rows ({id_dupes_removed:,}) — this "
+                        f"exceeds the {_MAX_SAFE_ID_REMOVAL_PCT:.0%} safety threshold "
+                        f"and looks like an ID collision, not real duplicates. "
+                        f"ABORTED — falling back to full-row dedup only."
+                    )
+                    id_dupes_removed = 0
+                else:
+                    # Recombine — rows with a missing id are NEVER dropped here.
+                    # Preserve original row order.
+                    self.df = pd.concat([deduped_non_null, null_part]).sort_index()
+
+                    if id_dupes_removed > 0:
+                        self.report.append(
+                            f"[DUPLICATES] ✅ {id_dupes_removed} duplicate '{id_col}' rows "
+                            f"removed ({uniqueness_ratio:.1%} pre-clean uniqueness — "
+                            f"trusted as dedup key)"
+                        )
+                        self.issues_found.append(f"{id_dupes_removed} id-based duplicates")
+                        self.fixes_applied.append(f"Removed {id_dupes_removed} duplicate '{id_col}' rows")
+                    else:
+                        self.report.append(
+                            f"[DUPLICATES] ✔ No duplicates found on non-null '{id_col}' values"
+                        )
+
+                    if n_null_ids > 0:
+                        self.report.append(
+                            f"[DUPLICATES] ℹ {n_null_ids} row(s) have a missing '{id_col}' — "
+                            f"these are NOT treated as duplicates of each other (a shared "
+                            f"missing ID isn't evidence of a real duplicate); they'll be "
+                            f"imputed later"
+                        )
 
         # ── Always run a definition-consistent, full-row duplicate check on
         # top — this is the same "duplicate rows" definition any stat-pill/
@@ -564,10 +649,24 @@ class DataCleaner:
             self.report.append(f"[DUPLICATES] ✔ No duplicate rows found")
 
         total_removed = before - len(self.df)
+        self.rows_after_dedup = len(self.df)
+
+        retention_pct = round((len(self.df) / before * 100), 1) if before else 100.0
         self.report.append(
-            f"[DUPLICATES] 📊 Total rows removed as duplicates: {total_removed} "
-            f"({id_dupes_removed} by id, {full_row_dupes_before} by full-row match)"
+            f"[DUPLICATES] 📊 Total rows removed: {total_removed} "
+            f"({id_dupes_removed} by id, {full_row_dupes_before} by full-row match) — "
+            f"retention {retention_pct}% ({len(self.df):,} of {before:,} rows kept)"
         )
+
+        # Loud, unmissable flag if overall retention still looks suspicious
+        # after both gates — this should be rare now, but if it happens it
+        # must not be buried in a routine log line.
+        if retention_pct < 90.0:
+            self.report.append(
+                f"[DUPLICATES] ⚠⚠ ROW RETENTION WARNING: only {retention_pct}% of rows "
+                f"survived deduplication. Verify this reflects genuine duplicate records "
+                f"and not an ID/key assumption issue before trusting downstream KPIs."
+            )
 
     # ── STEP 5: Fix currency symbols ──────────────────────────────────────────
     def step5_fix_currency(self):
@@ -947,11 +1046,29 @@ Your task:
                     fixed += 1
 
             # Phase 4: Title Case + fuzzy edit-distance dedup
+            # PERFORMANCE CAP: fuzzy merge is O(n^2) in unique value count.
+            # Above _MAX_FUZZY_UNIQUE_VALUES, skip it — Title Case still applies.
             post_non_null = self.df[col].dropna()
             title_cased   = post_non_null.apply(
                 lambda v: str(v).title() if isinstance(v, str) else v
             )
-            unique_tc    = title_cased.unique().tolist()
+            unique_tc = title_cased.unique().tolist()
+
+            if len(unique_tc) > _MAX_FUZZY_UNIQUE_VALUES:
+                self.report.append(
+                    f"[CATEGORICAL] ⚠ '{col}': {len(unique_tc)} unique values exceeds "
+                    f"fuzzy-merge performance threshold ({_MAX_FUZZY_UNIQUE_VALUES}) — "
+                    f"Title Case applied, fuzzy near-duplicate merge skipped."
+                )
+                self.df[col] = self.df[col].apply(
+                    lambda v: str(v).title() if isinstance(v, str) and pd.notna(v) else v
+                )
+                if changed_count > 0 or llm_used:
+                    if not llm_used:
+                        self.fixes_applied.append(f"Title Cased high-cardinality '{col}'")
+                        fixed += 1
+                continue
+
             canon_map    = _build_canonical_map(unique_tc, max_edit_dist=2)
             merges_fuzzy = {k: v for k, v in canon_map.items() if k != v}
 
@@ -985,7 +1102,7 @@ Your task:
         if fixed == 0:
             self.report.append(f"[CATEGORICAL] ✔ All text/categorical columns already clean")
 
-    # ── NULL SWEEP: re-run after step7 canonicalization ────────────────────────
+    # ── NULL SWEEP: re-run after step7 canonicalization (VECTORIZED) ───────────
     def _sweep_nulls_again(self):
         """
         Second null-string -> NaN pass, run after step7.
@@ -1003,26 +1120,22 @@ Your task:
         missing. The Phase 3 prompt now explicitly forbids the LLM from
         doing this, so ideally this sweep finds nothing — but relying on a
         prompt instruction alone is not a guarantee, hence this pass as a
-        backstop. This has not been confirmed to trigger in practice; treat
-        it as an untested safety net, not a verified fix.
+        backstop.
+
+        Rewritten to use vectorized pandas ops instead of a per-cell Python
+        loop — same rationale as step2.
         """
         pre_missing = int(self.df.isnull().sum().sum())
         total = 0
         for col in self.df.columns:
-            if pd.api.types.is_numeric_dtype(self.df[col]) or pd.api.types.is_datetime64_any_dtype(self.df[col]):
-                continue  # numeric columns already get this treatment in step12
-            new_col = []
-            count   = 0
-            for val in self.df[col]:
-                if val is None or (isinstance(val, float) and np.isnan(val)):
-                    new_col.append(np.nan)
-                elif isinstance(val, str) and (
-                    val.strip() in NULL_STRINGS or val.strip().lower() in _NULL_STRINGS_LOWER
-                ):
-                    new_col.append(np.nan); count += 1
-                else:
-                    new_col.append(val)
-            self.df[col] = new_col
+            s = self.df[col]
+            if pd.api.types.is_numeric_dtype(s) or pd.api.types.is_datetime64_any_dtype(s):
+                continue  # numeric/datetime columns already get this treatment in step12
+            str_s = s.astype(str).str.strip()
+            mask = str_s.str.lower().isin(_NULL_STRINGS_LOWER) & s.notna()
+            count = int(mask.sum())
+            if count:
+                self.df.loc[mask, col] = np.nan
             total += count
         if total > 0:
             post_missing = int(self.df.isnull().sum().sum())
@@ -1053,7 +1166,7 @@ Your task:
         if fixed == 0:
             self.report.append(f"[CORRUPTED] ✔ No corrupted ID/numeric fields found")
 
-    # ── STEP 9: RF Imputation ──────────────────────────────────────────────────
+    # ── STEP 9: RF Imputation (PERFORMANCE CAP on training rows) ──────────────
     def step9_rf_impute_missing(self):
         missing_cols = [c for c in self.df.columns if self.df[c].isnull().sum() > 0]
         if not missing_cols:
@@ -1066,6 +1179,8 @@ Your task:
             f"across {len(missing_cols)} column(s)"
         )
 
+        # Encode ONCE — this call also populates self._encoders, which is now
+        # the authoritative record of which columns are categorical.
         df_enc = self._encode_for_rf(self.df)
 
         for col in missing_cols:
@@ -1098,11 +1213,25 @@ Your task:
             y_train = df_enc.loc[known_mask,   col].values
             X_pred  = df_enc.loc[unknown_mask, feature_cols].fillna(0).values
 
+            # PERFORMANCE CAP — sample training rows on large datasets.
+            sampled_note = ""
+            if X_train.shape[0] > _MAX_RF_TRAIN_ROWS:
+                rng = np.random.RandomState(42)
+                idx = rng.choice(X_train.shape[0], _MAX_RF_TRAIN_ROWS, replace=False)
+                X_train, y_train = X_train[idx], y_train[idx]
+                sampled_note = f" (sampled {_MAX_RF_TRAIN_ROWS:,} of {known_mask.sum():,} rows for speed)"
+
+            # ── FIX: categorical-ness now comes from the encoding step itself
+            # (col in self._encoders), not a second, independently-computed
+            # dtype check that could silently disagree with it. A numeric
+            # low-cardinality column (e.g. a 1-5 star rating) is still
+            # correctly treated as categorical too. ─────────────────────────
+            is_cat = (
+                col in self._encoders
+                or (pd.api.types.is_numeric_dtype(self.df[col]) and self.df[col].nunique() <= 10)
+            )
+
             try:
-                is_cat = (
-                    self.df[col].dtype == object or
-                    (pd.api.types.is_numeric_dtype(self.df[col]) and self.df[col].nunique() <= 10)
-                )
                 model = (
                     RandomForestClassifier(n_estimators=150, max_depth=10, random_state=42, n_jobs=-1)
                     if is_cat else
@@ -1120,7 +1249,7 @@ Your task:
                 mtype = "Classifier" if is_cat else "Regressor"
                 self.report.append(
                     f"[IMPUTE] ✅ '{col}': {missing_count} missing ({missing_pct}%) → "
-                    f"RF {mtype} predicted (trained on {known_mask.sum():,} rows)"
+                    f"RF {mtype} predicted (trained on {X_train.shape[0]:,} rows{sampled_note})"
                 )
                 self.fixes_applied.append(f"RF predicted {missing_count} missing in '{col}'")
                 self._imputed_cols.add(col)
@@ -1135,7 +1264,20 @@ Your task:
             self.report.append(f"[IMPUTE] ✅ All missing values imputed successfully!")
 
     def _encode_for_rf(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Encodes non-numeric columns via LabelEncoder for RF feature use.
+        self._encoders now doubles as the SINGLE SOURCE OF TRUTH for
+        "this column is categorical" — step9 reads membership in this
+        dict instead of re-checking dtype independently, which is what
+        previously let a Regressor get fit on label-encoded categorical
+        targets (e.g. order_status, payment_method) whenever a column's
+        dtype wasn't exactly numpy `object` (pandas nullable "string"
+        dtype, or any dtype introduced by an intermediate astype call,
+        would silently fail a `dtype == object` check even though it was
+        genuinely categorical and got label-encoded here).
+        """
         df_num = pd.DataFrame(index=df.index)
+        self._encoders = {}  # reset per call — avoids stale entries across runs
         for col in df.columns:
             if pd.api.types.is_numeric_dtype(df[col]):
                 df_num[col] = df[col].astype(float)
@@ -1329,6 +1471,19 @@ Your task:
             )
         self.report.append(f"[VERDICT] {verdict}")
         return verdict
+
+    # ── Row-retention accessor (for crew.py's independent tripwire) ────────────
+    def get_row_retention(self) -> dict:
+        """
+        Returns the row counts around the dedup step specifically (not just
+        overall before/after clean), so callers can distinguish "rows lost
+        to dedup" from "rows lost to other steps" if ever needed.
+        """
+        return {
+            "rows_before_dedup": self.rows_before_dedup,
+            "rows_after_dedup": self.rows_after_dedup,
+            "original_shape": self.original_shape,
+        }
 
     # ── Main clean() ───────────────────────────────────────────────────────────
     def clean(self, columns_to_drop=None):

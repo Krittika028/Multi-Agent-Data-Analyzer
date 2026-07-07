@@ -13,6 +13,14 @@ Updated:
      and cite ratios (revenue per transaction, mean-vs-median gap as a skew
      signal), flag concentration risk, and connect every number to a decision
      — not just repeat totals/means/medians verbatim.
+  3. ROW RETENTION TRIPWIRE (this version) — a second, independent safety
+     check layered on top of data_cleaner.py's own dedup safety gates. Even
+     if a future cleaning bug causes silent row loss some other way, the
+     analyst agent is now contractually required to check the explicit
+     "ROW RETENTION CHECK" numbers passed in via cleaning_context (see
+     crew.py) and lead the report with a loud warning if more than 10% of
+     rows were dropped — rather than presenting KPIs as if they represent
+     the full dataset.
 """
 
 import json
@@ -51,6 +59,28 @@ comparison as fact:
 - When in doubt about whether a number is trustworthy, prefer describing
   what is definitely true (totals, counts, top/bottom performers) over a
   fragile percentage swing.
+
+ROW RETENTION TRIPWIRE (check this FIRST, before anything else in your output):
+
+The cleaning context you are given includes an explicit "ROW RETENTION CHECK"
+section showing the ORIGINAL row count vs. the CLEANED row count and the
+resulting retention percentage. This check is INDEPENDENT of anything the
+cleaning log itself claims — you must verify it yourself from the numbers
+given, even if the cleaning log shows no explicit errors or warnings.
+
+- If retention is below 90% (i.e. more than 10% of rows were removed during
+  cleaning), you MUST open your Executive Summary with a clear, prominent
+  warning stating the exact original row count, cleaned row count, and
+  percentage dropped — BEFORE any KPI, trend, or insight.
+- State plainly that all totals, KPIs, and trends below may understate true
+  business volume as a result, since they are computed only on the surviving
+  rows.
+- Do NOT bury this warning inside a caveat sentence at the end of the
+  summary, and do NOT proceed to present KPIs as if they represent the full
+  original dataset without this warning appearing first.
+- If retention is 90% or above, no special warning is needed — proceed
+  normally, but you may still briefly note the retention percentage in
+  passing for transparency.
 """
 
 # ── Shared instruction for analyst-grade KPI framing (not vanity numbers) ────
@@ -101,6 +131,10 @@ Your output must include:
 **1. Business Readiness Verdict**
 One of: Ready for Analysis | Proceed with Caution | High Risk
 Justify in one sentence using specific counts from the report.
+If the report contains a "ROW RETENTION WARNING" or shows any dedup step
+was aborted due to a safety threshold, this MUST be reflected in your
+verdict — a large unexplained row-count drop or an aborted dedup safety
+gate means "Proceed with Caution" at minimum, never "Ready for Analysis".
 
 **2. Data Quality Issues — Business Risk Translation**
 For every issue found, answer: "If this had NOT been fixed, which business
@@ -136,15 +170,25 @@ still carry uncertainty. Tell the analyst how to treat each one.
     )
 
 
-def get_analysis_task(verified_stats: dict, cleaning_context: str):
+def get_analysis_task(verified_stats: dict, cleaning_context: str, rows_dropped_pct: float = 0.0):
     stats_json = json.dumps(verified_stats, indent=2, default=str)
+
+    retention_warning_block = ""
+    if rows_dropped_pct and rows_dropped_pct > 10:
+        retention_warning_block = f"""
+⚠️ CRITICAL ROW RETENTION FLAG: {rows_dropped_pct}% of rows were removed
+during cleaning (see the ROW RETENTION CHECK in the cleaning context below).
+You MUST open your Executive Summary with an explicit warning about this
+before presenting any KPI, trend, or insight — per the ROW RETENTION
+TRIPWIRE rule below.
+"""
 
     return Task(
         description=f"""
 You are a Senior BI Analyst. Below is a VERIFIED STATISTICS PACKAGE
 computed deterministically from the dataset. Every number is exact.
 DO NOT recompute, estimate, or invent any figures.
-
+{retention_warning_block}
 VERIFIED STATISTICS (ground truth — use only these numbers):
 {stats_json}
 
@@ -158,6 +202,8 @@ Cleaning Context:
 Your output must follow this structure EXACTLY:
 
 **Executive Summary**
+- If the ROW RETENTION TRIPWIRE applies (see rules above), this section
+  MUST open with that warning before anything else.
 - Key numeric totals (e.g. Total Revenue, Total Transactions)
 - Average Order Value or equivalent primary metric, with mean-vs-median
   context (see ANALYST-GRADE FRAMING above)
@@ -215,11 +261,12 @@ important action the business should take right now.
         """,
         agent=get_analyst_agent(),
         expected_output=(
-            "A structured BI analysis with executive summary, KPI table, "
-            "category/segment breakdown tables, behavioral insights, "
-            "channel split, time analysis, top 5 insights, 5 recommendations, "
-            "and a management takeaway — all grounded in exact, reliable "
-            "verified numbers with analyst-grade context (ratios, skew, "
+            "A structured BI analysis with executive summary (leading with a "
+            "row-retention warning if more than 10% of rows were dropped during "
+            "cleaning), KPI table, category/segment breakdown tables, behavioral "
+            "insights, channel split, time analysis, top 5 insights, 5 "
+            "recommendations, and a management takeaway — all grounded in exact, "
+            "reliable verified numbers with analyst-grade context (ratios, skew, "
             "concentration risk), never a flagged or insufficient-sample metric."
         ),
     )
@@ -240,7 +287,17 @@ STRICT RULES:
 - Do NOT mention the dataset, data cleaning, missing values, data quality,
   imputation, null values, or anything related to how the data was processed.
 - Do NOT include any "Data Quality" section or data caveats of any kind.
-- Write ONLY about business performance, metrics, trends, and recommendations.
+- EXCEPTION: if the analysis findings above contain a row-retention warning
+  (i.e. a significant percentage of rows were removed during cleaning),
+  you MUST preserve that warning at the top of the Executive Summary in
+  plain business language (e.g. "This report reflects a subset of records
+  after data validation — see note below" is NOT acceptable phrasing;
+  state plainly that a portion of records could not be included and that
+  totals may understate true volume). This is the one data-related fact
+  that must survive into the business report, because omitting it would
+  make every number below misleading.
+- Write ONLY about business performance, metrics, trends, and recommendations
+  otherwise.
 - Every number must be preserved exactly as given in the analysis.
 - If the analysis explicitly notes a metric had insufficient data to reliably
   compare, preserve that honesty in the report rather than smoothing it into
@@ -259,6 +316,7 @@ Output the report in this exact structure:
 
 ## Executive Summary
 3–4 bullet points covering:
+- (If applicable) A leading row-retention warning per the rule above
 - Key revenue or volume totals with exact numbers
 - Top performing category/product/segment with its exact revenue or volume
 - Most important RELIABLE trend observed (skip if none clear the bar)
@@ -326,7 +384,8 @@ Expected outcome: [what business result this drives]
         agent=get_report_agent(),
         expected_output=(
             "A clean business performance report with no mention of data, "
-            "cleaning, or quality issues, and no unreliable/flagged percentage "
+            "cleaning, or quality issues (except a preserved row-retention "
+            "warning if one applies), and no unreliable/flagged percentage "
             "claims. Contains: executive summary bullets, KPI table with analyst "
             "judgment column, primary dimension breakdown tables with insights, "
             "behavioral patterns grounded in numbers, channel/payment tables, "
@@ -336,8 +395,17 @@ Expected outcome: [what business result this drives]
     )
 
 
-def get_business_summary_task(verified_stats: dict, dataset_name: str):
+def get_business_summary_task(verified_stats: dict, dataset_name: str, rows_dropped_pct: float = 0.0):
     stats_json = json.dumps(verified_stats, indent=2, default=str)
+
+    retention_instruction = ""
+    if rows_dropped_pct and rows_dropped_pct > 10:
+        retention_instruction = f"""
+IMPORTANT: {rows_dropped_pct}% of rows were removed during data cleaning.
+Your first sentence MUST briefly and plainly note that this summary reflects
+a subset of records and totals may understate true business volume, before
+moving to the performance finding.
+"""
 
     return Task(
         description=f"""
@@ -351,11 +419,13 @@ This is the first thing a business reader sees. It must:
    before citing any percentage change
 3. Give ONE specific opportunity or action the business should take (1 sentence)
 4. Optionally name the biggest risk or watch item (1 sentence)
-
+{retention_instruction}
 {DATA_RELIABILITY_RULES}
 
 Rules:
 - No mention of data cleaning, missing values, data quality, or imputation
+  UNLESS the row-retention instruction above applies — that one fact must
+  be stated plainly if it applies, everything else about cleaning stays out
 - No section headers, no bullet points
 - No statistical jargon ('mean', 'r_squared', 'std', 'coefficient')
 - Do not describe the dataset shape or column names
@@ -372,10 +442,10 @@ Output ONLY the paragraph. No title, no "Summary:" prefix, no markdown.
         """,
         agent=get_analyst_agent(),
         expected_output=(
-            "A 3-5 sentence business performance paragraph: what the business "
-            "does, the top RELIABLE performance finding with its exact number, "
-            "one specific opportunity or action, and optionally one risk. "
-            "No data/cleaning references, no unreliable percentage claims. "
-            "Plain prose only."
+            "A 3-5 sentence business performance paragraph: (if applicable) a "
+            "brief row-retention note, what the business does, the top "
+            "RELIABLE performance finding with its exact number, one specific "
+            "opportunity or action, and optionally one risk. No unreliable "
+            "percentage claims. Plain prose only."
         ),
     )
