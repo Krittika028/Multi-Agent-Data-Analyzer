@@ -139,7 +139,7 @@ for k, v in {
     "cleaned_df": None, "report_text": None, "cleaning_report": None,
     "show_dashboard": False, "dataset_name": None,
     "cols_to_remove": [], "df_original": None, "verified_stats": {},
-    "business_summary": "",
+    "business_summary": "", "domain_config": {},
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -196,7 +196,7 @@ if uploaded_file:
     if st.button("🚀 Clean & Analyze Dataset", type="primary", use_container_width=True):
         with st.spinner("⚙️ AI agents cleaning and analyzing your data..."):
             try:
-                cleaned_df, cleaning_report, report_text, verified_stats, business_summary = run_crew(
+                cleaned_df, cleaning_report, report_text, verified_stats, business_summary, domain_config = run_crew(
                     df,
                     st.session_state.dataset_name,
                 )
@@ -205,6 +205,7 @@ if uploaded_file:
                 st.session_state.report_text      = report_text
                 st.session_state.verified_stats   = verified_stats
                 st.session_state.business_summary = business_summary
+                st.session_state.domain_config     = domain_config   # NEW
                 st.session_state.cols_to_remove   = []
                 st.session_state.show_dashboard   = False
                 st.session_state.pop("chart_specs", None)
@@ -377,7 +378,11 @@ if st.session_state.show_dashboard and st.session_state.cleaned_df is not None:
                     f"{spec.get('reasoning', 'No reasoning provided.')}"
                 )
 
-    render_dashboard(cleaned_df, chart_specs, verified_stats, business_summary=business_summary)
+    render_dashboard(
+        cleaned_df, chart_specs, verified_stats,
+        business_summary=business_summary,
+        domain_config=st.session_state.get("domain_config", {}),
+    )
 
     if verified_stats.get("quality_score"):
         st.divider()

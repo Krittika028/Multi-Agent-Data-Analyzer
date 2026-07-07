@@ -19,6 +19,8 @@ from agents import get_cleaner_agent, get_analyst_agent, get_report_agent
 from data_cleaner import DataCleaner
 from stats_engine import StatsEngine
 import pandas as pd
+from domain_detector import DomainDetector
+from domain_context import get_domain_config, classify_status_values
 
 
 def run_crew(df: pd.DataFrame, dataset_name: str, columns_to_drop=None, model=None):
@@ -43,16 +45,37 @@ def run_crew(df: pd.DataFrame, dataset_name: str, columns_to_drop=None, model=No
     cleaned_rows     = cleaned_df.shape[0]
     retention_pct    = round((cleaned_rows / original_rows * 100), 1) if original_rows else 100.0
     rows_dropped_pct = round(100 - retention_pct, 1)
+    
+    # ── Domain detection — resolved ONCE per run, feeds every downstream
+    # consumer (stats engine's status classification, dashboard's KPI
+    # card 4 selection, and every report/task section naming). ──────────
+    try:
+        detector = DomainDetector()
+        domain_result = detector.detect(cleaned_df, {"log": cleaning_report})
+    except Exception:
+        domain_result = {}
+    domain_config = get_domain_config(domain_result)
 
-    # Step 2 — Compute VERIFIED statistics deterministically
+    # ── Status classification — LLM semantic pass over the ACTUAL status
+    # column values in THIS dataset, replacing the old commerce-keyword
+    # match so it works correctly on IT/HR/healthcare status columns too.
+    stats_engine_preview = StatsEngine(cleaned_df)
+    status_col = stats_engine_preview._find_status_column()
+    status_classification = None
+    if status_col:
+        unique_status_vals = cleaned_df[status_col].dropna().astype(str).unique().tolist()
+        status_classification = classify_status_values(status_col, unique_status_vals)
+
+    # Step 2 — Compute VERIFIED statistics deterministically, now with
+    # domain-aware status classification passed through.
     stats_engine = StatsEngine(cleaned_df)
-    verified_stats = stats_engine.generate_full_report()
+    verified_stats = stats_engine.generate_full_report(status_classification)
 
-    # Step 3 — Build context strings
     dataset_info = f"""
     Dataset Name   : {dataset_name}
     Original Shape : {df.shape[0]:,} rows x {df.shape[1]} columns
     Columns        : {', '.join(df.columns.tolist())}
+    Detected Domain: {domain_config['domain']} (primary entity: {domain_config['primary_entity']})
     """
 
     cleaning_verdict = next(
@@ -85,23 +108,18 @@ def run_crew(df: pd.DataFrame, dataset_name: str, columns_to_drop=None, model=No
     {verified_stats.get('quality_score', 'Not computed')}
     """
 
-    # Step 4 — Create tasks (row retention threaded into analysis + summary)
     cleaning_task = get_cleaning_task(cleaning_report, dataset_info)
-    analysis_task = get_analysis_task(verified_stats, cleaning_context, rows_dropped_pct)
+    analysis_task = get_analysis_task(verified_stats, cleaning_context, rows_dropped_pct, domain_config)
     report_task   = get_report_task(
         analysis_context="[See context from previous tasks]",
         dataset_name=dataset_name,
+        domain_config=domain_config,
     )
-    summary_task  = get_business_summary_task(verified_stats, dataset_name, rows_dropped_pct)
+    summary_task  = get_business_summary_task(verified_stats, dataset_name, rows_dropped_pct, domain_config)
 
-    # Report agent sees both cleaning + analysis context.
-    # Summary task only needs the analysis context — it stays short and
-    # independent of the full 8-section report.
     report_task.context = [cleaning_task, analysis_task]
     summary_task.context = [analysis_task]
 
-    # Step 5 — Assemble agents, optionally overriding the LLM per the
-    # sidebar's "AI Model" dropdown (st.session_state.selected_model)
     agents = [get_cleaner_agent(), get_analyst_agent(), get_report_agent()]
     if model:
         for agent in agents:
@@ -116,12 +134,9 @@ def run_crew(df: pd.DataFrame, dataset_name: str, columns_to_drop=None, model=No
 
     result = crew.kickoff()
 
-    # Pull each task's own output directly rather than relying solely on
-    # the crew's final result, since report_task and summary_task are
-    # independent leaves (summary_task isn't "after" report_task).
     report_text      = str(report_task.output) if report_task.output else str(result)
     business_summary = str(summary_task.output) if summary_task.output else ""
 
-    # Step 6 — Return exactly 5 values (unchanged signature — callers like
-    # home_page.py don't need any changes)
-    return cleaned_df, cleaning_report, report_text, verified_stats, business_summary
+    # Step 6 — Return 6 values now (added domain_config) so home_page.py
+    # can pass it to render_dashboard for domain-aware KPI cards.
+    return cleaned_df, cleaning_report, report_text, verified_stats, business_summary, domain_config

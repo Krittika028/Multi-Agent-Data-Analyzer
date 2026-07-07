@@ -469,7 +469,7 @@ class StatsEngine:
         preferred = [c for c in candidates if "final" in c.lower() or "total" in c.lower()]
         return preferred[0] if preferred else candidates[0]
 
-    def compute_revenue_by_status(self):
+    def compute_revenue_by_status(self, status_classification: dict = None):
         """
         Returns None if there's no usable status column or monetary
         column. Otherwise returns:
@@ -480,9 +480,19 @@ class StatsEngine:
               "completed_statuses": [...],
               "non_completed_statuses": [...],
               "total_revenue_all_rows": float,
-              "reliable_revenue": float,   # excludes non-completed statuses
-              "excluded_revenue": float,   # revenue sitting in non-completed rows
+              "reliable_revenue": float,
+              "excluded_revenue": float,
             }
+
+        status_classification: optional {"non_completed": [...], "completed": [...]}
+        produced by domain_context.classify_status_values() over the ACTUAL
+        values in this dataset's status column. When provided, this REPLACES
+        the old hardcoded keyword match (_NON_COMPLETED_STATUS_KEYWORDS),
+        which only recognized commerce fulfillment language and would
+        silently do nothing (or misclassify) on IT/HR/healthcare status
+        columns. When not provided (e.g. called standalone without the
+        domain-aware crew.py wiring), falls back to the original keyword
+        match so this method still works in isolation.
         """
         status_col = self._find_status_column()
         rev_col    = self._find_primary_monetary_column()
@@ -496,6 +506,10 @@ class StatsEngine:
         grouped = sub.groupby(status_col)[rev_col].agg(["sum", "count"]).reset_index()
         total_revenue = float(sub[rev_col].sum())
 
+        non_completed_set = None
+        if status_classification is not None:
+            non_completed_set = set(status_classification.get("non_completed", []))
+
         breakdown = []
         completed_statuses = []
         non_completed_statuses = []
@@ -504,7 +518,18 @@ class StatsEngine:
             status = str(row[status_col])
             revenue = float(row["sum"])
             count = int(row["count"])
-            is_non_completed = any(kw in status.lower() for kw in _NON_COMPLETED_STATUS_KEYWORDS)
+
+            if non_completed_set is not None:
+                # Domain-aware classification — exact match against the
+                # LLM's semantic read of THIS dataset's actual values.
+                is_non_completed = status in non_completed_set
+            else:
+                # Fallback: original commerce-keyword substring match,
+                # only used when no domain-aware classification was passed.
+                is_non_completed = any(
+                    kw in status.lower() for kw in _NON_COMPLETED_STATUS_KEYWORDS
+                )
+
             (non_completed_statuses if is_non_completed else completed_statuses).append(status)
             breakdown.append({
                 "status": status,
@@ -528,6 +553,7 @@ class StatsEngine:
             "total_revenue_all_rows": round(total_revenue, 2),
             "reliable_revenue": round(reliable_revenue, 2),
             "excluded_revenue": round(excluded_revenue, 2),
+            "classification_method": "llm_domain_aware" if non_completed_set is not None else "keyword_fallback",
         }
 
     # =====================================
@@ -813,7 +839,7 @@ class StatsEngine:
     # =====================================
     # FULL REPORT — everything bundled for the LLM prompt
     # =====================================
-    def generate_full_report(self):
+    def generate_full_report(self, status_classification: dict = None):
         period_data = self.compute_period_trends()
         return {
             "shape":              {"rows": self.df.shape[0], "columns": self.df.shape[1]},
@@ -826,6 +852,6 @@ class StatsEngine:
             "volume_anomalies":   period_data.get("volume_anomalies", []),
             "anomalies":          self.compute_anomalies(),
             "category_summary":   self.compute_category_summary(),
-            "revenue_by_status":  self.compute_revenue_by_status(),
+            "revenue_by_status":  self.compute_revenue_by_status(status_classification),
             "ml_insights":        self.compute_ml_insights(),
         }

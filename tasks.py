@@ -112,6 +112,55 @@ add the one layer of judgment a real analyst would:
   value is low there."
 """
 
+def get_analyst_framing_rules(domain_config: dict = None) -> str:
+    """
+    Replaces the previously hardcoded ANALYST_FRAMING_RULES, which assumed
+    revenue/transactions/channels exist in every dataset. Ratio/skew/
+    concentration-risk framing is genuinely domain-agnostic and unchanged
+    below — only the EXAMPLE vocabulary is now parameterized so the LLM
+    isn't steered toward "revenue per transaction" language on an HR or
+    IT dataset where that concept doesn't exist.
+    """
+    domain_config = domain_config or {}
+    entity = domain_config.get("primary_entity", "Record")
+    dimension = domain_config.get("dimension_label", "Category/Segment")
+    entity_plural = domain_config.get("entity_plural", "Records")
+
+    return f"""
+ANALYST-GRADE FRAMING (write like a human analyst, not a numbers dictation service):
+
+For every KPI or metric you cite, don't just restate mean/median/total —
+add the one layer of judgment a real analyst would:
+
+- Ratios over raw totals where possible: metric per {entity.lower()},
+  metric per {dimension.split('/')[0].lower()}, or any other per-unit
+  ratio the actual columns support. These are usually more decision-
+  relevant than a raw total alone.
+- Mean vs median gap = a skew signal, not just two numbers. If mean is
+  meaningfully higher than median, say what that implies (a small number
+  of large/outlier {entity_plural.lower()} are pulling the average up —
+  the "typical" {entity.lower()} is smaller than the headline average
+  suggests). If mean and median are close, say the metric is consistent/
+  predictable.
+- Concentration risk: if one {dimension.lower()} accounts for a
+  disproportionate share of the primary metric or volume relative to its
+  count, name that explicitly as a dependency risk, not just "top
+  performer."
+- Context over isolated numbers: don't just restate a headline average —
+  say what that means relative to the median, relative to other
+  {dimension.lower()} values, or relative to what it implies about the
+  underlying process or behavior.
+- Every recommendation must trace to a SPECIFIC number and explain the
+  mechanism — not "improve X" but "Y {dimension.split('/')[0].lower()}
+  drives only Z% of the primary metric despite W% of volume — investigate
+  why value is low there."
+"""
+
+
+# Kept for any external code that still imports the raw string — resolves
+# to the domain-agnostic default (generic "Record"/"Category" wording).
+ANALYST_FRAMING_RULES = get_analyst_framing_rules(None)
+
 
 def get_cleaning_task(cleaning_report: list, dataset_info: str):
     return Task(
@@ -170,25 +219,36 @@ still carry uncertainty. Tell the analyst how to treat each one.
     )
 
 
-def get_analysis_task(verified_stats: dict, cleaning_context: str, rows_dropped_pct: float = 0.0):
+def get_analysis_task(verified_stats: dict, cleaning_context: str, rows_dropped_pct: float = 0.0, domain_config: dict = None):
     stats_json = json.dumps(verified_stats, indent=2, default=str)
+    domain_config = domain_config or {}
+    dimension_label = domain_config.get("dimension_label", "Category/Segment")
+    entity_plural = domain_config.get("entity_plural", "Records")
+    domain_name = domain_config.get("domain", "")
 
-    retention_warning_block = ""
-    if rows_dropped_pct and rows_dropped_pct > 10:
-        retention_warning_block = f"""
-⚠️ CRITICAL ROW RETENTION FLAG: {rows_dropped_pct}% of rows were removed
-during cleaning (see the ROW RETENTION CHECK in the cleaning context below).
-You MUST open your Executive Summary with an explicit warning about this
-before presenting any KPI, trend, or insight — per the ROW RETENTION
-TRIPWIRE rule below.
+    retention_warning = ""
+    if rows_dropped_pct > 10:
+        retention_warning = f"""
+⚠️ CRITICAL: {rows_dropped_pct}% of rows were removed during cleaning.
+You MUST lead your Executive Summary with this warning before any other content.
 """
+
+    domain_note = (
+        f"\nDATASET DOMAIN: this data has been identified as **{domain_name}** data, "
+        f"where each row represents a **{domain_config.get('primary_entity', 'record')}**. "
+        f"Use domain-appropriate section names and vocabulary throughout your analysis — "
+        f"e.g. use \"{dimension_label} Performance\" instead of a generic or commerce-specific "
+        f"section name, and refer to rows as \"{entity_plural}\" rather than defaulting to "
+        f"\"transactions\" or \"orders\" if those terms don't fit this domain.\n"
+        if domain_name else ""
+    )
 
     return Task(
         description=f"""
 You are a Senior BI Analyst. Below is a VERIFIED STATISTICS PACKAGE
 computed deterministically from the dataset. Every number is exact.
 DO NOT recompute, estimate, or invent any figures.
-{retention_warning_block}
+{retention_warning}{domain_note}
 VERIFIED STATISTICS (ground truth — use only these numbers):
 {stats_json}
 
@@ -197,41 +257,38 @@ Cleaning Context:
 
 {DATA_RELIABILITY_RULES}
 
-{ANALYST_FRAMING_RULES}
+{get_analyst_framing_rules(domain_config)}
 
-Your output must follow this structure EXACTLY:
+Your output must follow this structure — adapt section TITLES to fit the
+domain noted above, but keep the same underlying content requirements:
 
 **Executive Summary**
-- If the ROW RETENTION TRIPWIRE applies (see rules above), this section
-  MUST open with that warning before anything else.
-- Key numeric totals (e.g. Total Revenue, Total Transactions)
-- Average Order Value or equivalent primary metric, with mean-vs-median
-  context (see ANALYST-GRADE FRAMING above)
+- Key numeric totals for this dataset's primary metrics
+- Primary average metric, with mean-vs-median context (see ANALYST-GRADE FRAMING above)
 - 3–4 bullet points summarizing the most important RELIABLE patterns
 - Keep it factual and concise — no unreliable percentage claims
 
-**Core Business KPIs**
+**Core {domain_config.get('primary_entity', 'Business')} KPIs**
 Present as a markdown table:
 | KPI | Value | What it means |
 Include: totals, averages (with mean-vs-median skew note where relevant),
-highest/lowest performing category, best/worst period. The third column
-should add analyst judgment, not repeat the number.
+highest/lowest performing {dimension_label.split('/')[0].lower()}, best/worst period.
+The third column should add analyst judgment, not repeat the number.
 
-**Category / Product / Segment Performance** (use whatever dimension fits the data)
-- Revenue or volume breakdown per category as a markdown table
-- Revenue per unit or per transaction as a separate markdown table
+**{dimension_label} Performance**
+- Breakdown per {dimension_label.split('/')[0].lower()} as a markdown table
+- Per-unit ratio breakdown as a separate markdown table, if the data supports one
 - 1–2 sentence insight below each table naming any concentration risk or
-  cross-sell opportunity — not just describing the numbers
+  opportunity — not just describing the numbers
 
-**Customer / Behavioral Patterns** (if applicable)
-- Volume leaders vs revenue leaders — are they the same?
-- What does high volume but low revenue suggest?
+**Behavioral / Process Patterns** (if applicable to this domain)
+- Volume leaders vs value leaders — are they the same {dimension_label.split('/')[0].lower()}?
+- What does high volume but low value/outcome suggest?
 - What opportunities does this create?
 
-**Channel / Segment Split** (if applicable)
-- Breakdown table by channel, region, or segment
-- Is revenue balanced or concentrated? Name the concentration risk if one exists.
-- What does the distribution suggest?
+**Segment / Channel Split** (if a genuine secondary dimension exists in the data)
+- Breakdown table by whatever secondary dimension fits (region, team, source, etc.)
+- Is the primary metric balanced or concentrated? Name the concentration risk if one exists.
 
 **Time / Period Analysis**
 - Monthly, quarterly, or yearly breakdown table
@@ -240,39 +297,38 @@ should add analyst judgment, not repeat the number.
 - Is the trend growing, declining, or flat? If not enough reliable data
   exists to say, state that plainly instead of guessing
 
-**Top 5 Business Insights**
+**Top 5 Insights**
 Numbered list. Each insight must:
 - State an exact, RELIABLE number from the verified stats (never a flagged
   or excluded one)
-- Explain what it means for the business in plain English, with analyst
-  judgment (ratio, concentration, skew — not just the raw figure)
+- Explain what it means in plain English, with analyst judgment
 - Name one specific opportunity or risk it creates
 
 **Strategic Recommendations**
 Exactly 5 recommendations. Each must:
 - Be grounded in a specific, reliable number from the analysis
-- Name a concrete action (e.g. "Bundle Coffee + Cake to increase basket size")
-- State the expected business outcome
+- Name a concrete action
+- State the expected outcome
 - Be written in plain operational language — no jargon
 
 **Management Takeaway**
 2–3 sentences summarizing the overall picture and the single most 
-important action the business should take right now.
+important action to take right now.
         """,
         agent=get_analyst_agent(),
         expected_output=(
-            "A structured BI analysis with executive summary (leading with a "
-            "row-retention warning if more than 10% of rows were dropped during "
-            "cleaning), KPI table, category/segment breakdown tables, behavioral "
-            "insights, channel split, time analysis, top 5 insights, 5 "
-            "recommendations, and a management takeaway — all grounded in exact, "
-            "reliable verified numbers with analyst-grade context (ratios, skew, "
-            "concentration risk), never a flagged or insufficient-sample metric."
+            "A structured analysis with executive summary, KPI table, "
+            f"{dimension_label} breakdown tables, behavioral insights, "
+            "segment split, time analysis, top 5 insights, 5 recommendations, "
+            "and a management takeaway — all grounded in exact, reliable "
+            "verified numbers with analyst-grade context, using domain-"
+            "appropriate section names and vocabulary rather than a fixed "
+            "commerce template, and never a flagged or insufficient-sample metric."
         ),
     )
 
 
-def get_report_task(analysis_context: str, dataset_name: str):
+def get_report_task(analysis_context: str, dataset_name: str, domain_config: dict = None):
     return Task(
         description=f"""
 You are writing a business performance report for operations managers
@@ -308,7 +364,7 @@ STRICT RULES:
 - Every recommendation must reference a specific number.
 - Every insight must be grounded in a metric from the analysis.
 
-{ANALYST_FRAMING_RULES}
+{get_analyst_framing_rules(domain_config)}
 
 Output the report in this exact structure:
 
@@ -395,7 +451,7 @@ Expected outcome: [what business result this drives]
     )
 
 
-def get_business_summary_task(verified_stats: dict, dataset_name: str, rows_dropped_pct: float = 0.0):
+def get_business_summary_task(verified_stats: dict, dataset_name: str, rows_dropped_pct: float = 0.0, domain_config: dict = None):
     stats_json = json.dumps(verified_stats, indent=2, default=str)
 
     retention_instruction = ""

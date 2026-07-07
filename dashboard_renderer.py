@@ -20,7 +20,7 @@ import plotly.graph_objects as go
 import streamlit as st
 import pandas as pd
 import numpy as np
-
+from domain_context import get_domain_config, DEFAULT_LABELS
 # ── Palette ────────────────────────────────────────────────────────────────────
 DARK   = "#0a0a0f"
 CARD   = "#1a1a2e"
@@ -33,13 +33,12 @@ ACCENT = [
 ]
 
 # ── Business context lookup ────────────────────────────────────────────────────
-# NOTE: "count"/"total"/"sum" etc are deliberately generic/weak keywords —
-# a column literally named "total_spent" or "sales_amount" should be caught
-# by the money-specific groups (revenue/cost/price/...) FIRST, even though
-# it also happens to contain the substring "total". _get_business_context
-# below no longer picks the first list-order match; it scores every group
-# by specificity and prefers the most specific (and money-typed) match, so
-# this ordering is a fallback rather than an authoritative priority list.
+# BUSINESS_CONTEXT stays as-is (unchanged) — it's the commerce-domain
+# vocabulary and still applies whenever those keywords genuinely appear
+# (many domains share words like "cost", "count", "score"). What changes
+# is _get_business_context now also checks a domain-provided extra list
+# FIRST, so a domain-specific label (e.g. "Diagnosis" for healthcare) wins
+# over a generic fallback when the column doesn't match commerce keywords.
 BUSINESS_CONTEXT = [
     (["revenue", "sales", "income", "turnover", "gmv"],          "💰", "Revenue",     "$"),
     (["profit", "margin", "earnings", "ebit", "ebitda", "net"],  "📈", "Profit",       "$"),
@@ -62,23 +61,20 @@ BUSINESS_CONTEXT = [
 ]
 
 
-def _get_business_context(col_name: str):
+def _get_business_context(col_name: str, domain_extra: list = None):
     """
-    Picks the best-matching business label for a column name.
-
-    Instead of returning the FIRST keyword-group that matches (which lets
-    a generic substring like "total" in "total_spent" win over the much
-    more specific and correct "spent"/money match), every group that
-    matches is scored by specificity — the length of the matched keyword —
-    and the most specific match wins. Ties prefer whichever group appears
-    earlier in BUSINESS_CONTEXT (money-typed groups are listed first).
-    A dollar-prefixed match is additionally preferred over a same-length
-    non-dollar match, since money columns are the more actionable label.
+    domain_extra: optional list of (keywords, emoji, label, prefix) tuples
+    supplied by the calling domain — checked with the SAME specificity
+    scoring as BUSINESS_CONTEXT, and merged into the same competition
+    rather than short-circuiting it, so a truly better generic commerce
+    match (e.g. an HR dataset that also has a genuine "salary" column)
+    isn't incorrectly overridden by a weaker domain-specific guess.
     """
     col_lower = col_name.lower()
+    all_groups = list(BUSINESS_CONTEXT) + list(domain_extra or [])
 
-    best = None  # (specificity, prefix_bonus, -list_index) -> context tuple
-    for idx, (keywords, emoji, label, prefix) in enumerate(BUSINESS_CONTEXT):
+    best = None
+    for idx, (keywords, emoji, label, prefix) in enumerate(all_groups):
         matched_kw = None
         for kw in keywords:
             if kw in col_lower:
@@ -569,7 +565,7 @@ def render_business_context_summary(business_summary: str):
 # a distinct signal.)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def render_kpi_cards(df: pd.DataFrame, verified_stats: dict):
+def render_kpi_cards(df: pd.DataFrame, verified_stats: dict, domain_config: dict = None):
     """
     Four cards, each a distinct signal — not four views of the same number:
 
@@ -681,45 +677,76 @@ def render_kpi_cards(df: pd.DataFrame, verified_stats: dict):
         if c.get("column") not in excluded_cols and (c.get("top_values") or [])
     ]
 
-    if revenue_by_status and revenue_by_status.get("excluded_revenue", 0) > 0:
-        excluded_rev = revenue_by_status["excluded_revenue"]
-        total_rev    = revenue_by_status.get("total_revenue_all_rows") or 0
-        pct_at_risk  = (excluded_rev / total_rev * 100) if total_rev else 0
-        statuses     = revenue_by_status.get("non_completed_statuses", [])
-        _, _, rev_prefix = _get_business_context(revenue_by_status.get("revenue_column", ""))
-        status_label = ", ".join(statuses) if statuses else "non-completed orders"
-        _card(
-            cols[3], _format_value(excluded_rev, rev_prefix), "⚠️ REVENUE AT RISK",
-            caption=f"{pct_at_risk:.1f}% tied up in {status_label}",
-        )
-    elif good_segment_cols:
-        seg_entry = good_segment_cols[0]
-        seg_col   = seg_entry["column"]
-        top_val_entry = seg_entry["top_values"][0]
-        seg_name  = str(top_val_entry.get("value", "N/A"))
-        if primary_kpi["column"] in df.columns and seg_col in df.columns:
-            kpi_col = primary_kpi["column"]
-            df_num  = _ensure_numeric(df, kpi_col)
-            seg_total   = df_num.loc[df[seg_col].astype(str) == seg_name, kpi_col].sum()
-            grand_total = df_num[kpi_col].sum()
-            seg_pct_of_kpi = (seg_total / grand_total * 100) if grand_total else 0
+    # ── Slot 4 is now domain-conditional, not hardcoded to commerce
+    # "Revenue at Risk". domain_config["kpi4_type"] (from domain_context.py)
+    # picks which signal type is appropriate for this dataset's domain —
+    # "revenue_at_risk" for retail/finance, "top_segment" for
+    # insurance/healthcare/logistics, "secondary_kpi" for HR/education/etc.
+    # where a risk-style metric doesn't naturally exist. This still falls
+    # back gracefully through the same priority chain if the preferred
+    # signal isn't actually available in this dataset.
+    kpi4_type = (domain_config or {}).get("kpi4_type", "secondary_kpi")
+
+    def _try_revenue_at_risk():
+        if revenue_by_status and revenue_by_status.get("excluded_revenue", 0) > 0:
+            excluded_rev = revenue_by_status["excluded_revenue"]
+            total_rev    = revenue_by_status.get("total_revenue_all_rows") or 0
+            pct_at_risk  = (excluded_rev / total_rev * 100) if total_rev else 0
+            statuses     = revenue_by_status.get("non_completed_statuses", [])
+            _, _, rev_prefix = _get_business_context(revenue_by_status.get("revenue_column", ""))
+            status_label = ", ".join(statuses) if statuses else "non-completed records"
             _card(
-                cols[3], seg_name[:18], f"🏆 TOP {seg_col.replace('_',' ').upper()}",
-                caption=f"{_format_value(seg_total, prefix)} · {seg_pct_of_kpi:.1f}% of {label.lower()}",
+                cols[3], _format_value(excluded_rev, rev_prefix), "⚠️ VALUE AT RISK",
+                caption=f"{pct_at_risk:.1f}% tied up in {status_label}",
             )
-        else:
-            _card(cols[3], seg_name[:18], f"🏆 TOP {seg_col.replace('_',' ').upper()}")
-    elif len(ranked) > 1:
-        secondary_kpi = ranked[1]
-        emoji2, label2, prefix2 = _get_business_context(secondary_kpi["column"])
-        _card(
-            cols[3],
-            _format_value(secondary_kpi.get("mean") or 0, prefix2),
-            f"{emoji2} AVG {label2.upper()}",
-            _trend_html(secondary_kpi["column"]),
-        )
-    else:
-        _card(cols[3], "N/A", "📊 No secondary signal", caption="Dataset has a single business metric")
+            return True
+        return False
+
+    def _try_top_segment():
+        if good_segment_cols:
+            seg_entry = good_segment_cols[0]
+            seg_col   = seg_entry["column"]
+            top_val_entry = seg_entry["top_values"][0]
+            seg_name  = str(top_val_entry.get("value", "N/A"))
+            if primary_kpi["column"] in df.columns and seg_col in df.columns:
+                kpi_col = primary_kpi["column"]
+                df_num  = _ensure_numeric(df, kpi_col)
+                seg_total   = df_num.loc[df[seg_col].astype(str) == seg_name, kpi_col].sum()
+                grand_total = df_num[kpi_col].sum()
+                seg_pct_of_kpi = (seg_total / grand_total * 100) if grand_total else 0
+                _card(
+                    cols[3], seg_name[:18], f"🏆 TOP {seg_col.replace('_',' ').upper()}",
+                    caption=f"{_format_value(seg_total, prefix)} · {seg_pct_of_kpi:.1f}% of {label.lower()}",
+                )
+            else:
+                _card(cols[3], seg_name[:18], f"🏆 TOP {seg_col.replace('_',' ').upper()}")
+            return True
+        return False
+
+    def _try_secondary_kpi():
+        if len(ranked) > 1:
+            secondary_kpi = ranked[1]
+            emoji2, label2, prefix2 = _get_business_context(secondary_kpi["column"])
+            _card(
+                cols[3],
+                _format_value(secondary_kpi.get("mean") or 0, prefix2),
+                f"{emoji2} AVG {label2.upper()}",
+                _trend_html(secondary_kpi["column"]),
+            )
+            return True
+        return False
+
+    # Try the domain-preferred slot type first, then fall back through
+    # the others in a sensible order if the preferred one has no data.
+    _SLOT4_STRATEGIES = {
+        "revenue_at_risk": [_try_revenue_at_risk, _try_top_segment, _try_secondary_kpi],
+        "top_segment":     [_try_top_segment, _try_revenue_at_risk, _try_secondary_kpi],
+        "secondary_kpi":   [_try_secondary_kpi, _try_top_segment, _try_revenue_at_risk],
+    }
+    strategies = _SLOT4_STRATEGIES.get(kpi4_type, _SLOT4_STRATEGIES["secondary_kpi"])
+
+    if not any(strategy() for strategy in strategies):
+        _card(cols[3], "N/A", "📊 No secondary signal", caption=f"Dataset has a single {(domain_config or {}).get('primary_entity', 'record')}-level metric")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1212,27 +1239,15 @@ def render_dashboard(
     chart_specs: list,
     verified_stats: dict = None,
     business_summary: str = "",
+    domain_config: dict = None,
 ):
     verified_stats = verified_stats or {}
 
-    # ── 1. KPI cards — 3 fixed slots + 1 contextual slot ───────────────────────
-    render_kpi_cards(df, verified_stats)
+    render_kpi_cards(df, verified_stats, domain_config)
 
-    # ── 2. Business context paragraph ────────────────────────────────────────
     if business_summary:
         render_business_context_summary(business_summary)
 
     st.markdown("<div style='margin-bottom:1.5rem;'></div>", unsafe_allow_html=True)
 
-    # ── 3. Essential charts only — ONE curated section, hard-capped.
-    # Previously this was 3 independent, uncapped chart paths (a line chart
-    # per trend + a forecast, 4-6 AI-selected charts, and up to 3 more
-    # auto category-breakdown bars) stacked with no shared limit — easily
-    # 8-10+ charts, most disconnected from the one story the business
-    # summary tells. Now: at most 1 trend line (the strongest, reliable
-    # one — the same signal the summary's "top performance finding"
-    # sentence is built from) + at most 3 AI-curated charts, already
-    # grounded in verified_stats with per-chart reasoning. Forecast and
-    # the separate auto-breakdown pass are dropped as redundant with what
-    # render_ai_charts already covers.
     render_essential_charts(df, chart_specs, verified_stats)

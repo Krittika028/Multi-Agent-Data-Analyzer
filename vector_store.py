@@ -11,6 +11,7 @@ import chromadb
 from datetime import datetime
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
+
 # ── Where ChromaDB saves data on disk ──────────────────────────────
 CHROMA_PATH = os.path.join(os.path.dirname(__file__), "chroma_db")
 
