@@ -14,6 +14,6 @@ scikit-learn
 python-dateutil
 markdown
 xhtml2pdf
-pytorch
+torch
 torchvision
 statsmodels
