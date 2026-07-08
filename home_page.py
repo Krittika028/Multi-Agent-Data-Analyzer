@@ -191,9 +191,23 @@ if uploaded_file:
             tmp.write(uploaded_file.getbuffer())
             tmp_path = tmp.name
 
-        lf = pl.scan_csv(tmp_path)
-        preview_df = lf.head(20).collect().to_pandas()
-        df = lf.collect(streaming=True).to_pandas()
+        try:
+            # infer_schema_length=0 forces every column to Utf8 instead of
+            # guessing a dtype from the first 100 rows. On messy real-world
+            # CSVs — the exact input this app exists to handle — a column
+            # that looks numeric for 100 rows and then hits a stray "N/A"
+            # or "₹1,200" otherwise raises polars.exceptions.ComputeError
+            # deep inside .collect(), with the real cause redacted on
+            # Streamlit Cloud. Load as strings; let DataCleaner do type
+            # inference downstream, where it's already built to happen.
+            lf = pl.scan_csv(tmp_path, infer_schema_length=0, ignore_errors=True)
+            preview_df = lf.head(20).collect().to_pandas()
+            df = lf.collect(streaming=True).to_pandas()
+        except Exception as e:
+            st.warning(f"Fast CSV loader failed ({e}); falling back to a slower, tolerant reader.")
+            df = pd.read_csv(tmp_path, dtype=str, encoding="utf-8", encoding_errors="replace",
+                              on_bad_lines="warn", engine="python")
+            preview_df = df.head(20)
 
         os.unlink(tmp_path)  # clean up temp file once loaded into memory
     else:
