@@ -26,6 +26,43 @@ from crewai import Task
 from agents import get_cleaner_agent, get_analyst_agent, get_report_agent
 
 
+# ── Prompt-size guard ─────────────────────────────────────────────────────
+# compute_period_trends() in stats_engine.py builds `monthly_sales` as a
+# cross product of (date_column × numeric_column × month) with no cap —
+# on a small/clean test dataset this stays tiny, but on a real SMB dataset
+# with several date-like columns and many numeric columns over a few years
+# of history, this list (and similarly `period_trends`/`anomalies`/
+# `volume_anomalies`) can run into the thousands of entries. Serialized
+# with json.dumps and injected into TWO separate task prompts (analysis +
+# business summary), that's what caused a 211k-token single message
+# against a 128k-token model limit — not a one-off, but the direct result
+# of an unbounded structure being dumped into an LLM prompt.
+#
+# This is a symptom fix (cap what reaches the prompt), not a fix to the
+# stats engine's cross-product computation itself — the dashboard's own
+# copy of verified_stats is untouched, only what gets serialized here.
+_MAX_LIST_ITEMS_IN_PROMPT = 40
+
+
+def _capped_for_prompt(verified_stats: dict) -> dict:
+    """Returns a shallow copy of verified_stats with any top-level list
+    truncated to _MAX_LIST_ITEMS_IN_PROMPT items, so a single unbounded
+    field can't blow the prompt past the model's context window. Keeps a
+    trailing note when truncation happens so the agent knows the full
+    dataset was larger than what it's seeing."""
+    capped = {}
+    for key, value in verified_stats.items():
+        if isinstance(value, list) and len(value) > _MAX_LIST_ITEMS_IN_PROMPT:
+            capped[key] = value[:_MAX_LIST_ITEMS_IN_PROMPT] + [
+                {"_truncated_note": f"... {len(value) - _MAX_LIST_ITEMS_IN_PROMPT} more "
+                                     f"'{key}' entries omitted for prompt size — full data "
+                                     f"is still used in the dashboard."}
+            ]
+        else:
+            capped[key] = value
+    return capped
+
+
 # ── Shared reliability contract injected into every stats-consuming task ─────
 DATA_RELIABILITY_RULES = """
 DATA RELIABILITY RULES (apply before citing ANY trend or period comparison):
@@ -242,7 +279,7 @@ still carry uncertainty. Tell the analyst how to treat each one.
 
 
 def get_analysis_task(verified_stats: dict, cleaning_context: str, rows_dropped_pct: float = 0.0, domain_config: dict = None):
-    stats_json = json.dumps(verified_stats, indent=2, default=str)
+    stats_json = json.dumps(_capped_for_prompt(verified_stats), indent=2, default=str)
     domain_config = domain_config or {}
     dimension_label = domain_config.get("dimension_label", "Category/Segment")
     entity_plural = domain_config.get("entity_plural", "Records")
@@ -531,7 +568,7 @@ that qualitative stake explicitly rather than inventing a number]
 
 
 def get_business_summary_task(verified_stats: dict, dataset_name: str, rows_dropped_pct: float = 0.0, domain_config: dict = None):
-    stats_json = json.dumps(verified_stats, indent=2, default=str)
+    stats_json = json.dumps(_capped_for_prompt(verified_stats), indent=2, default=str)
 
     retention_instruction = ""
     if rows_dropped_pct and rows_dropped_pct > 10:
