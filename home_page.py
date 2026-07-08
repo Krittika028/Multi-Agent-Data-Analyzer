@@ -19,6 +19,7 @@ from crew import run_crew
 import re
 from vector_store import store_report
 import polars as pl
+import tempfile
 
 # ── Page config — must be first st call ───────────────────────────────────────
 st.set_page_config(
@@ -178,17 +179,24 @@ uploaded_file = st.file_uploader("📂 Upload Dataset (CSV or Excel)", type=["cs
 if uploaded_file:
     size_mb = uploaded_file.size / (1024 * 1024)
     if size_mb > 300:
-        st.error(f"File is {size_mb:.0f}MB — this deployment supports up to 300MB. Try filtering or sampling the data first.")
+        st.error(f"File is {size_mb:.0f}MB — this deployment supports up to 300MB.")
         st.stop()
 
     st.session_state.dataset_name = uploaded_file.name.rsplit(".", 1)[0]
 
     if uploaded_file.name.endswith(".csv"):
-        lf = pl.scan_csv(uploaded_file)
+        # Write to a real temp file on disk — Polars lazy scanning needs an
+        # actual path, not an in-memory UploadedFile buffer.
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+            tmp.write(uploaded_file.getbuffer())
+            tmp_path = tmp.name
+
+        lf = pl.scan_csv(tmp_path)
         preview_df = lf.head(20).collect().to_pandas()
         df = lf.collect(streaming=True).to_pandas()
+
+        os.unlink(tmp_path)  # clean up temp file once loaded into memory
     else:
-        # polars excel read is eager only, no lazy scan for xlsx
         df = pl.read_excel(uploaded_file).to_pandas()
         preview_df = df.head(20)
 
