@@ -18,6 +18,7 @@ import os
 from crew import run_crew
 import re
 from vector_store import store_report
+import polars as pl
 
 # ── Page config — must be first st call ───────────────────────────────────────
 st.set_page_config(
@@ -175,8 +176,24 @@ st.divider()
 uploaded_file = st.file_uploader("📂 Upload Dataset (CSV or Excel)", type=["csv", "xlsx"])
 
 if uploaded_file:
+    size_mb = uploaded_file.size / (1024 * 1024)
+    if size_mb > 300:
+        st.error(f"File is {size_mb:.0f}MB — this deployment supports up to 300MB. Try filtering or sampling the data first.")
+        st.stop()
+
+if uploaded_file:
     st.session_state.dataset_name = uploaded_file.name.rsplit(".", 1)[0]
-    df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
+    
+if uploaded_file.name.endswith(".csv"):
+    lf = pl.scan_csv(uploaded_file)
+else:
+    # polars excel read is eager only, no lazy scan for xlsx
+    df = pl.read_excel(uploaded_file).to_pandas()
+
+if uploaded_file.name.endswith(".csv"):
+    # Only materialize what you need for preview — not the full file
+    preview_df = lf.head(20).collect().to_pandas()
+    df = lf.collect(streaming=True).to_pandas()
     st.session_state.df_original = df
 
     none_count = sum((df == s).sum().sum() for s in ["None", "none", "NULL", "null", "nan", "NaN", "NA", "N/A"])
@@ -210,6 +227,13 @@ if uploaded_file:
                 st.session_state.show_dashboard   = False
                 st.session_state.pop("chart_specs", None)
                 st.session_state.pop("chart_specs_for", None)
+
+                # ── NEW: free the raw upload once cleaning succeeded ──────
+                if "df_original" in st.session_state:
+                    del st.session_state["df_original"]
+                    import gc; gc.collect()
+                # ────────────────────────────────────────────────────────
+
                 st.success("✅ Done! Dataset cleaned and analyzed.")
 
                 chunks = store_report(
