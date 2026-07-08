@@ -567,34 +567,51 @@ def render_business_context_summary(business_summary: str):
 
 def render_kpi_cards(df: pd.DataFrame, verified_stats: dict, domain_config: dict = None):
     """
-    Four cards, each a distinct signal — not four views of the same number:
+    Four cards — business metrics only. No risk, flag, outlier, or anomaly
+    framing anywhere in this function; that content belongs in the written
+    report, not the KPI strip.
 
-      1. PRIMARY VOLUME — total of the top-ranked business KPI (money/volume
-         metrics outrank generic numeric columns), with its trend arrow +
-         pct change inline if a reliable trend exists for that column.
-      2. SECONDARY KPI — the next-ranked KPI's average (+ median), with its
-         own trend if available. Falls back to a plain transaction count if
-         there's only one KPI in the dataset.
-      3. TOP SEGMENT — the leading category's actual revenue/KPI contribution
-         (not just row share), pulled only from genuine low-cardinality
-         business dimensions — near-identifier columns (order_id,
-         customer_id) are filtered out via _high_cardinality_cols().
-      4. REVENUE AT RISK — value sitting in non-completed order statuses
-         (cancelled/pending/failed) when a status column exists; otherwise a
-         third KPI, then a plain record count — never an invented risk metric.
+      1. TOTAL REVENUE — a genuine revenue/sales/amount-type column, summed.
+         If no such column exists in this dataset, this card is NOT faked;
+         it falls back to the domain's actual primary metric with an
+         honest label (e.g. "TOTAL SALARY" for HR data) instead of
+         pretending revenue exists where it doesn't.
+      2. ADAPTIVE SECOND METRIC — the best *distinct* business signal this
+         dataset actually has: average order/transaction value if there's
+         a revenue column, otherwise the next-ranked KPI's average. Not a
+         repeat of card 1 in a different shape.
+      3. VOLUME — total records, labeled with the domain's actual entity
+         name (Orders / Patients / Employees / etc.), not a generic count.
+      4. TOP PERFORMER — the leading business segment's actual contribution
+         (e.g. top category's revenue share), or a growth-rate signal if no
+         good segment column exists. Never a risk/at-risk framing.
 
-    Visual grammar matches a clean executive KPI strip: big bold number
-    first, muted label + trend arrow directly under it, optional caption.
+    Card composition is driven by what's actually present in THIS dataset —
+    a dataset with no category column and no second KPI will legitimately
+    look different from one that has both, rather than forcing 4 fixed
+    shapes onto every dataset regardless of what it contains.
     """
     kpis        = verified_stats.get("kpis", [])
     trends      = verified_stats.get("trends", [])
     cat_summary = verified_stats.get("category_summary", [])
-    revenue_by_status = verified_stats.get("revenue_by_status")
 
     if not kpis:
         return
 
     trend_by_col = {t.get("value_column"): t for t in trends}
+    entity_plural = (domain_config or {}).get("entity_plural", "Records")
+
+    # ── Revenue-specific detection — deliberately narrower than the general
+    # KPI priority list. "Volume"/"Transactions"-type columns rank high for
+    # general KPI purposes but are NOT revenue, and showing them under a
+    # "TOTAL REVENUE" label would be a fabricated business claim. ──────────
+    _REVENUE_KEYWORDS = ["revenue", "sales", "gmv", "amount", "price", "earnings", "income", "turnover"]
+
+    def _is_revenue_col(kpi):
+        col_lower = kpi.get("column", "").lower()
+        return any(k in col_lower for k in _REVENUE_KEYWORDS)
+
+    revenue_kpi = next((k for k in kpis if _is_revenue_col(k)), None)
 
     _HIGH_PRIORITY = [
         "revenue", "sales", "profit", "cost", "price", "amount", "total",
@@ -606,7 +623,8 @@ def render_kpi_cards(df: pd.DataFrame, verified_stats: dict, domain_config: dict
         return 0 if any(k in col_lower for k in _HIGH_PRIORITY) else 1
 
     ranked = sorted(kpis, key=_priority)
-    primary_kpi = ranked[0]
+    primary_kpi = revenue_kpi or ranked[0]
+    remaining_kpis = [k for k in ranked if k["column"] != primary_kpi["column"]]
 
     def _trend_html(raw_col):
         """Colored inline trend badge for a KPI, or None if no reliable trend exists."""
@@ -644,63 +662,55 @@ def render_kpi_cards(df: pd.DataFrame, verified_stats: dict, domain_config: dict
     _section_header("💼 Key Business KPIs")
     cols = st.columns(4)
 
-    # ── 1 — TOTAL of primary metric (always present, label adapts to domain) ──
+    # ── 1 — TOTAL REVENUE (guaranteed real, never fabricated) ────────────────
     emoji, label, prefix = _get_business_context(primary_kpi["column"])
     total = (primary_kpi.get("mean") or 0) * len(df)
+    card1_label = f"💰 TOTAL REVENUE" if revenue_kpi else f"{emoji} TOTAL {label.upper()}"
     _card(
         cols[0],
         _format_value(total, prefix),
-        f"{emoji} TOTAL {label.upper()}",
+        card1_label,
         _trend_html(primary_kpi["column"]),
     )
 
-    # ── 2 — AVERAGE of primary metric (always present, not a fallback) ────────
-    avg_val = primary_kpi.get("mean") or 0
-    med_val = primary_kpi.get("median") or 0
-    _card(
-        cols[1],
-        _format_value(avg_val, prefix),
-        f"{emoji} AVG {label.upper()}",
-        caption=f"Median {_format_value(med_val, prefix)}",
-    )
+    # ── 2 — Adaptive second metric: avg order/transaction value when we
+    # have real revenue, otherwise the next best distinct KPI. Never just
+    # re-shows card 1's number as an average. ─────────────────────────────
+    if revenue_kpi:
+        avg_val = revenue_kpi.get("mean") or 0
+        med_val = revenue_kpi.get("median") or 0
+        _card(
+            cols[1],
+            _format_value(avg_val, prefix),
+            f"🧮 AVG ORDER VALUE",
+            caption=f"Median {_format_value(med_val, prefix)}",
+        )
+    elif remaining_kpis:
+        second_kpi = remaining_kpis[0]
+        emoji2, label2, prefix2 = _get_business_context(second_kpi["column"])
+        _card(
+            cols[1],
+            _format_value(second_kpi.get("mean") or 0, prefix2),
+            f"{emoji2} AVG {label2.upper()}",
+            _trend_html(second_kpi["column"]),
+        )
+    else:
+        avg_val = primary_kpi.get("mean") or 0
+        med_val = primary_kpi.get("median") or 0
+        _card(cols[1], _format_value(avg_val, prefix), f"{emoji} AVG {label.upper()}",
+              caption=f"Median {_format_value(med_val, prefix)}")
 
-    # ── 3 — TOTAL TRANSACTIONS / RECORDS (always present, literal row count) ──
-    _card(cols[2], f"{len(df):,}", "🧾 TOTAL TRANSACTIONS", caption="Records analyzed")
+    # ── 3 — VOLUME, labeled with the actual entity for this dataset ──────────
+    _card(cols[2], f"{len(df):,}", f"🧾 TOTAL {entity_plural.upper()}", caption="Records analyzed")
 
-    # ── 4 — Best remaining contextual signal for THIS dataset ─────────────────
-    # Priority: revenue-at-risk (actionable) > top segment > secondary KPI.
-    # This is the one slot that genuinely changes shape by domain/dataset —
-    # slots 1-3 are the fixed, always-present metrics you asked for.
+    # ── 4 — TOP PERFORMER: leading segment's real revenue/KPI contribution,
+    # or a growth-rate signal as fallback. No risk/at-risk framing — that
+    # kind of flag belongs in the written report, not the KPI strip. ────────
     excluded_cols = _high_cardinality_cols(verified_stats)
     good_segment_cols = [
         c for c in cat_summary
         if c.get("column") not in excluded_cols and (c.get("top_values") or [])
     ]
-
-    # ── Slot 4 is now domain-conditional, not hardcoded to commerce
-    # "Revenue at Risk". domain_config["kpi4_type"] (from domain_context.py)
-    # picks which signal type is appropriate for this dataset's domain —
-    # "revenue_at_risk" for retail/finance, "top_segment" for
-    # insurance/healthcare/logistics, "secondary_kpi" for HR/education/etc.
-    # where a risk-style metric doesn't naturally exist. This still falls
-    # back gracefully through the same priority chain if the preferred
-    # signal isn't actually available in this dataset.
-    kpi4_type = (domain_config or {}).get("kpi4_type", "secondary_kpi")
-
-    def _try_revenue_at_risk():
-        if revenue_by_status and revenue_by_status.get("excluded_revenue", 0) > 0:
-            excluded_rev = revenue_by_status["excluded_revenue"]
-            total_rev    = revenue_by_status.get("total_revenue_all_rows") or 0
-            pct_at_risk  = (excluded_rev / total_rev * 100) if total_rev else 0
-            statuses     = revenue_by_status.get("non_completed_statuses", [])
-            _, _, rev_prefix = _get_business_context(revenue_by_status.get("revenue_column", ""))
-            status_label = ", ".join(statuses) if statuses else "non-completed records"
-            _card(
-                cols[3], _format_value(excluded_rev, rev_prefix), "⚠️ VALUE AT RISK",
-                caption=f"{pct_at_risk:.1f}% tied up in {status_label}",
-            )
-            return True
-        return False
 
     def _try_top_segment():
         if good_segment_cols:
@@ -723,9 +733,23 @@ def render_kpi_cards(df: pd.DataFrame, verified_stats: dict, domain_config: dict
             return True
         return False
 
+    def _try_growth_rate():
+        trend = trend_by_col.get(primary_kpi["column"])
+        if trend and trend.get("pct_change_start_to_end") is not None and not trend.get("insufficient_edge_data"):
+            pct = trend["pct_change_start_to_end"]
+            direction = (trend.get("direction") or "").lower()
+            arrow = "▲" if "increas" in direction else ("▼" if "decreas" in direction else "→")
+            _card(
+                cols[3], f"{arrow} {pct:+.1f}%", "📈 GROWTH RATE",
+                caption=f"{label} change over period",
+            )
+            return True
+        return False
+
     def _try_secondary_kpi():
-        if len(ranked) > 1:
-            secondary_kpi = ranked[1]
+        pool = [k for k in remaining_kpis if k["column"] != (revenue_kpi or {}).get("column")]
+        if pool:
+            secondary_kpi = pool[0]
             emoji2, label2, prefix2 = _get_business_context(secondary_kpi["column"])
             _card(
                 cols[3],
@@ -736,17 +760,8 @@ def render_kpi_cards(df: pd.DataFrame, verified_stats: dict, domain_config: dict
             return True
         return False
 
-    # Try the domain-preferred slot type first, then fall back through
-    # the others in a sensible order if the preferred one has no data.
-    _SLOT4_STRATEGIES = {
-        "revenue_at_risk": [_try_revenue_at_risk, _try_top_segment, _try_secondary_kpi],
-        "top_segment":     [_try_top_segment, _try_revenue_at_risk, _try_secondary_kpi],
-        "secondary_kpi":   [_try_secondary_kpi, _try_top_segment, _try_revenue_at_risk],
-    }
-    strategies = _SLOT4_STRATEGIES.get(kpi4_type, _SLOT4_STRATEGIES["secondary_kpi"])
-
-    if not any(strategy() for strategy in strategies):
-        _card(cols[3], "N/A", "📊 No secondary signal", caption=f"Dataset has a single {(domain_config or {}).get('primary_entity', 'record')}-level metric")
+    if not any(strategy() for strategy in (_try_top_segment, _try_growth_rate, _try_secondary_kpi)):
+        _card(cols[3], f"{len(df):,}", f"🧾 TOTAL {entity_plural.upper()}", caption="No additional segment signal in this dataset")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
