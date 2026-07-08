@@ -111,7 +111,7 @@ def run_crew(df: pd.DataFrame, dataset_name: str, columns_to_drop=None, model=No
     cleaning_task = get_cleaning_task(cleaning_report, dataset_info)
     analysis_task = get_analysis_task(verified_stats, cleaning_context, rows_dropped_pct, domain_config)
     report_task   = get_report_task(
-        analysis_context="[See context from previous tasks]",
+        analysis_context="[The full analyst output above — use it directly, do not summarize away specific numbers, ratios, or the BLUF paragraph]",
         dataset_name=dataset_name,
         domain_config=domain_config,
     )

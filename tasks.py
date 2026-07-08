@@ -1,26 +1,24 @@
 """
-tasks.py
+tasks.py — rewritten for insight density.
 
-Updated:
-  1. DATA RELIABILITY RULES — every task that consumes verified_stats now
-     explicitly checks the sample-size guard fields added in stats_engine.py
-     (insufficient_edge_data, excluded_years, start_sample_size, end_sample_size,
-     total_sample_size, min_sample_size_required) before it's allowed to state
-     a percentage change as fact. A null/flagged metric gets narrated as
-     "not enough data to compare" — never silently skipped, never invented.
-  2. ANALYST-GRADE KPI FRAMING — the analyst and report agents are now told
-     to behave like a human analyst, not a numbers dictation service: compute
-     and cite ratios (revenue per transaction, mean-vs-median gap as a skew
-     signal), flag concentration risk, and connect every number to a decision
-     — not just repeat totals/means/medians verbatim.
-  3. ROW RETENTION TRIPWIRE (this version) — a second, independent safety
-     check layered on top of data_cleaner.py's own dedup safety gates. Even
-     if a future cleaning bug causes silent row loss some other way, the
-     analyst agent is now contractually required to check the explicit
-     "ROW RETENTION CHECK" numbers passed in via cleaning_context (see
-     crew.py) and lead the report with a loud warning if more than 10% of
-     rows were dropped — rather than presenting KPIs as if they represent
-     the full dataset.
+Key changes vs. previous version:
+  1. BLUF (Bottom Line Up Front) is now MANDATORY, not optional — every
+     report/summary opens with a 2-3 sentence answer to "what happened and
+     what do I do about it," before any table or KPI appears.
+  2. Ratios, skew commentary, and concentration risk are no longer "if
+     applicable" — they are REQUIRED wherever the underlying columns exist,
+     with an explicit instruction that skipping them is a failure condition.
+  3. COMPARATIVE ANCHORING RULE — no number may be presented in isolation.
+     Every KPI must be stated against at least one benchmark: category
+     average, prior reliable period, or peer segment.
+  4. Recommendations now require a quantified "stake" — not just an action,
+     but the estimated $ or % impact of acting vs. not acting, computed only
+     from verified numbers (never invented).
+  5. report_task explicitly treats injected task.context as primary source
+     of truth and is forbidden from diluting the analyst's BLUF, ratios, or
+     comparisons during reformatting.
+  6. All other behavior (reliability rules, row-retention tripwire, domain
+     adaptivity) is preserved unchanged from the previous version.
 """
 
 import json
@@ -83,44 +81,68 @@ given, even if the cleaning log shows no explicit errors or warnings.
   passing for transparency.
 """
 
-# ── Shared instruction for analyst-grade KPI framing (not vanity numbers) ────
-ANALYST_FRAMING_RULES = """
-ANALYST-GRADE FRAMING (write like a human analyst, not a numbers dictation service):
+# ── NEW: mandatory insight-density contract, applied to analyst + report ─────
+INSIGHT_DENSITY_RULES = """
+INSIGHT DENSITY RULES — these are REQUIREMENTS, not suggestions. A report
+that skips any of these because "it wasn't applicable" is only acceptable if
+you can point to which specific verified-stats field made it genuinely
+impossible (e.g. no categorical column existed to compute a ratio against).
+Absence of effort is not the same as absence of data.
 
-For every KPI or metric you cite, don't just restate mean/median/total —
-add the one layer of judgment a real analyst would:
+1. BOTTOM LINE UP FRONT (BLUF) — MANDATORY, FIRST THING IN THE OUTPUT:
+   Before any table, KPI list, or section header, write 2-3 sentences that
+   answer: "What is the single most important thing happening in this
+   business right now, and what should the reader do about it in the next
+   week?" This is not a summary of sections below — it is the ANSWER, stated
+   plainly, with the one number that matters most. A reader who reads only
+   this paragraph and nothing else should still know what to do.
 
-- Ratios over raw totals where possible: revenue per transaction, revenue
-  per customer, discount as % of revenue, cost per unit, etc. These are
-  usually more decision-relevant than a raw total alone.
-- Mean vs median gap = a skew signal, not just two numbers. If mean is
-  meaningfully higher than median, say what that implies (a small number
-  of large orders/outliers are pulling the average up — the "typical"
-  order is smaller than the headline average suggests). If mean and
-  median are close, say the metric is consistent/predictable.
-- Concentration risk: if one category/channel/segment accounts for a
-  disproportionate share of revenue or volume relative to its count,
-  name that explicitly as a dependency risk, not just "top performer."
-- Context over isolated numbers: don't just say "Average Order Value is
-  $1,706.74" — say what that means relative to the median, relative to
-  other categories, or relative to what it implies about customer
-  behavior (e.g. are most orders small with a few large outliers, or is
-  spending fairly uniform?).
-- Every recommendation must trace to a SPECIFIC number and explain the
-  mechanism — not "improve marketing" but "X channel drives only Y% of
-  revenue despite Z% of transaction volume — investigate why conversion
-  value is low there."
+2. NO ISOLATED NUMBERS — every KPI, total, or metric you state must be
+   anchored against at least ONE comparison point:
+     - vs. the category/segment average (e.g. "23% above the average category")
+     - vs. a prior reliable period (only if not flagged insufficient/excluded)
+     - vs. another segment/channel in the same dataset
+   "Revenue was $45,000" is a data dump. "Salads generated $45,000 — 2.3x the
+   average category's $19,600" is an insight. If truly no comparison point
+   exists for a given number (rare), say so explicitly rather than silently
+   omitting the comparison.
+
+3. RATIOS ARE REQUIRED WHENEVER THE COLUMNS EXIST — not optional:
+   revenue/volume per unit, per transaction, per segment member, discount as
+   % of revenue, cost per unit — compute and state at least 2 such ratios
+   if the underlying numeric + categorical columns exist in verified_stats.
+   If none of the required column combinations exist in this dataset, say
+   explicitly "no per-unit ratio could be computed because [specific reason]"
+   rather than silently skipping the section.
+
+4. MEAN-VS-MEDIAN SKEW — for every primary KPI, compare mean to median and
+   state what the gap implies (a few large outliers vs. a consistent
+   pattern). This is required for every KPI table, not just the first one.
+
+5. CONCENTRATION / DEPENDENCY RISK — for every category breakdown, identify
+   whether the top entry holds a disproportionate share (top entry's % of
+   total vs. its % of row count). If the top category holds >40% of the
+   primary metric, this MUST be named explicitly as a dependency risk with
+   a sentence on what happens if that segment underperforms.
+
+6. QUANTIFIED RECOMMENDATION STAKES — every recommendation must state not
+   just the action, but the estimated stake, computed from verified numbers:
+   "If category X's share moved from A% to B% (matching the top performer),
+   that implies roughly $Y in additional [metric]." Use only real numbers
+   from verified_stats for this math — never invent a projection number
+   that isn't derivable from what's given. If a clean quantified estimate
+   truly isn't derivable, state the qualitative stakes explicitly instead
+   of silently reverting to vague language like "could improve results."
+
+7. NAME THE MECHANISM, NOT JUST THE PATTERN — never write "X is
+   underperforming." Write what specifically is happening: "X has 3x the
+   order volume of Y but only 1.1x the revenue — average order value in X is
+   roughly a third of Y's, suggesting X attracts high-frequency, low-basket
+   customers while Y attracts fewer, higher-spend customers."
 """
 
+# ── Shared instruction for analyst-grade KPI framing (not vanity numbers) ────
 def get_analyst_framing_rules(domain_config: dict = None) -> str:
-    """
-    Replaces the previously hardcoded ANALYST_FRAMING_RULES, which assumed
-    revenue/transactions/channels exist in every dataset. Ratio/skew/
-    concentration-risk framing is genuinely domain-agnostic and unchanged
-    below — only the EXAMPLE vocabulary is now parameterized so the LLM
-    isn't steered toward "revenue per transaction" language on an HR or
-    IT dataset where that concept doesn't exist.
-    """
     domain_config = domain_config or {}
     entity = domain_config.get("primary_entity", "Record")
     dimension = domain_config.get("dimension_label", "Category/Segment")
@@ -154,11 +176,11 @@ add the one layer of judgment a real analyst would:
   mechanism — not "improve X" but "Y {dimension.split('/')[0].lower()}
   drives only Z% of the primary metric despite W% of volume — investigate
   why value is low there."
+
+{INSIGHT_DENSITY_RULES}
 """
 
 
-# Kept for any external code that still imports the raw string — resolves
-# to the domain-agnostic default (generic "Record"/"Category" wording).
 ANALYST_FRAMING_RULES = get_analyst_framing_rules(None)
 
 
@@ -247,7 +269,9 @@ You MUST lead your Executive Summary with this warning before any other content.
         description=f"""
 You are a Senior BI Analyst. Below is a VERIFIED STATISTICS PACKAGE
 computed deterministically from the dataset. Every number is exact.
-DO NOT recompute, estimate, or invent any figures.
+DO NOT recompute, estimate, or invent any figures — but you ARE required
+to derive ratios, comparisons, and percentages FROM these exact numbers
+wherever the underlying fields exist (see INSIGHT DENSITY RULES below).
 {retention_warning}{domain_note}
 VERIFIED STATISTICS (ground truth — use only these numbers):
 {stats_json}
@@ -262,28 +286,39 @@ Cleaning Context:
 Your output must follow this structure — adapt section TITLES to fit the
 domain noted above, but keep the same underlying content requirements:
 
+**Bottom Line Up Front**
+(MANDATORY — see INSIGHT DENSITY RULES, rule 1. This comes before anything
+else, including the row-retention warning if one applies — the retention
+warning is its own sentence within or immediately after this paragraph,
+not a replacement for it.)
+2-3 sentences: what matters most right now, the one number that proves it,
+and what to do about it this week.
+
 **Executive Summary**
-- Key numeric totals for this dataset's primary metrics
-- Primary average metric, with mean-vs-median context (see ANALYST-GRADE FRAMING above)
+- Key numeric totals for this dataset's primary metrics — each anchored
+  against a comparison point (see rule 2)
+- Primary average metric, with mean-vs-median context (rule 4)
 - 3–4 bullet points summarizing the most important RELIABLE patterns
 - Keep it factual and concise — no unreliable percentage claims
 
 **Core {domain_config.get('primary_entity', 'Business')} KPIs**
 Present as a markdown table:
-| KPI | Value | What it means |
-Include: totals, averages (with mean-vs-median skew note where relevant),
+| KPI | Value | vs. Benchmark | What it means |
+Include: totals, averages (with mean-vs-median skew note per rule 4),
 highest/lowest performing {dimension_label.split('/')[0].lower()}, best/worst period.
-The third column should add analyst judgment, not repeat the number.
+The "vs. Benchmark" column is required (rule 2) — average, prior period, or
+peer segment. The last column carries analyst judgment, not a repeated number.
 
 **{dimension_label} Performance**
 - Breakdown per {dimension_label.split('/')[0].lower()} as a markdown table
-- Per-unit ratio breakdown as a separate markdown table, if the data supports one
-- 1–2 sentence insight below each table naming any concentration risk or
-  opportunity — not just describing the numbers
+- Per-unit ratio breakdown as a REQUIRED second table (rule 3) unless you
+  state explicitly why no ratio is computable
+- 2-3 sentence insight below each table naming concentration risk (rule 5)
+  and the underlying mechanism (rule 7), not just describing the numbers
 
 **Behavioral / Process Patterns** (if applicable to this domain)
 - Volume leaders vs value leaders — are they the same {dimension_label.split('/')[0].lower()}?
-- What does high volume but low value/outcome suggest?
+- What does high volume but low value/outcome suggest? Name the mechanism.
 - What opportunities does this create?
 
 **Segment / Channel Split** (if a genuine secondary dimension exists in the data)
@@ -299,32 +334,39 @@ The third column should add analyst judgment, not repeat the number.
 
 **Top 5 Insights**
 Numbered list. Each insight must:
-- State an exact, RELIABLE number from the verified stats (never a flagged
-  or excluded one)
-- Explain what it means in plain English, with analyst judgment
-- Name one specific opportunity or risk it creates
+- State an exact, RELIABLE number from the verified stats, anchored against
+  a comparison point (never a flagged or excluded one)
+- Name the underlying mechanism (rule 7), not just restate the pattern
+- Name one specific opportunity or risk it creates, with a quantified stake
+  where derivable (rule 6)
 
 **Strategic Recommendations**
 Exactly 5 recommendations. Each must:
 - Be grounded in a specific, reliable number from the analysis
 - Name a concrete action
-- State the expected outcome
+- State the QUANTIFIED expected outcome per rule 6 (derived from verified
+  numbers — never invented) — if truly not derivable, state the qualitative
+  stake explicitly instead of vague language
 - Be written in plain operational language — no jargon
 
 **Management Takeaway**
 2–3 sentences summarizing the overall picture and the single most 
-important action to take right now.
+important action to take right now. This should echo — not contradict —
+the Bottom Line Up Front paragraph.
         """,
         agent=get_analyst_agent(),
         expected_output=(
-            "A structured analysis with executive summary, KPI table, "
-            f"{dimension_label} breakdown tables, behavioral insights, "
-            "segment split, time analysis, top 5 insights, 5 recommendations, "
-            "and a management takeaway — all grounded in exact, reliable "
-            "verified numbers with analyst-grade context, using domain-"
-            "appropriate section names and vocabulary rather than a fixed "
-            "commerce template, and never a flagged or insufficient-sample metric."
-        ),
+            "A structured analysis opening with a mandatory Bottom Line Up "
+            "Front paragraph, followed by executive summary, KPI table with "
+            "benchmark column, {0} breakdown tables including a per-unit "
+            "ratio table, behavioral insights naming mechanisms not just "
+            "patterns, segment split, time analysis, top 5 insights each "
+            "with a quantified stake, 5 recommendations each with a "
+            "quantified expected outcome, and a management takeaway — all "
+            "grounded in exact, reliable verified numbers, every number "
+            "anchored against a comparison point, using domain-appropriate "
+            "vocabulary, and never a flagged or insufficient-sample metric."
+        ).format(dimension_label),
     )
 
 
@@ -336,8 +378,22 @@ and business owners.
 
 Dataset Name: {dataset_name}
 
-Analysis Findings:
+Analysis Findings (this is your PRIMARY SOURCE OF TRUTH — it was produced
+by a senior analyst who already did the ratio math, comparison anchoring,
+and mechanism analysis; your job is to format and polish it, NOT to
+re-summarize it into something vaguer):
 {analysis_context}
+
+CRITICAL — DO NOT DILUTE THE SOURCE MATERIAL:
+- The analysis already contains a "Bottom Line Up Front" paragraph, ratio
+  tables, benchmark comparisons, concentration-risk callouts, and quantified
+  recommendation stakes. PRESERVE these exactly — do not compress a
+  quantified stake ("$X potential uplift") down to a vague verb phrase
+  ("could improve results"). If you shorten prose, shorten padding, never
+  the numbers or the mechanism explanation.
+- If a specific ratio, comparison, or quantified stake appears in the
+  analysis findings, it MUST appear somewhere in your final report. Losing
+  it during formatting is a failure condition.
 
 STRICT RULES:
 - Do NOT mention the dataset, data cleaning, missing values, data quality,
@@ -359,10 +415,13 @@ STRICT RULES:
   compare, preserve that honesty in the report rather than smoothing it into
   a confident percentage — say "not enough data to compare" in plain business
   language instead of a caveat-flavored data disclaimer.
-- Keep all markdown tables intact and properly formatted.
+- Keep all markdown tables intact and properly formatted, including any
+  "vs. Benchmark" columns and per-unit ratio tables from the analysis.
 - Write in plain operational English — no jargon, no abstract strategy language.
-- Every recommendation must reference a specific number.
-- Every insight must be grounded in a metric from the analysis.
+- Every recommendation must reference a specific number AND its quantified
+  stake, exactly as computed in the analysis findings.
+- Every insight must be grounded in a metric from the analysis, anchored
+  against the same comparison point the analyst used.
 
 {get_analyst_framing_rules(domain_config)}
 
@@ -370,20 +429,27 @@ Output the report in this exact structure:
 
 # {dataset_name} — Business Performance Report
 
+## Bottom Line
+(MANDATORY, FIRST SECTION — carry the analyst's Bottom Line Up Front
+paragraph through essentially unchanged. This is the single most important
+part of the report. A reader who stops here should already know what
+matters and what to do.)
+
 ## Executive Summary
 3–4 bullet points covering:
 - (If applicable) A leading row-retention warning per the rule above
-- Key revenue or volume totals with exact numbers
+- Key revenue or volume totals with exact numbers, anchored vs. benchmark
 - Top performing category/product/segment with its exact revenue or volume
+  AND how it compares to the average/other segments
 - Most important RELIABLE trend observed (skip if none clear the bar)
-- Single most important opportunity
+- Single most important opportunity, with its quantified stake if derivable
 
 ## Core Business KPIs
 Markdown table:
-| KPI | Value | What it means |
+| KPI | Value | vs. Benchmark | What it means |
 Include: all key totals, averages, top performer, bottom performer,
-best period, worst period. Third column carries analyst judgment
-(ratio, skew, or context) — never just a restated number.
+best period, worst period. The benchmark column and the judgment column
+are both required — never just a restated number.
 
 ## [Primary Dimension] Performance
 Replace [Primary Dimension] with whatever fits — Product, Category,
@@ -391,22 +457,27 @@ Region, Customer Segment, etc.
 
 Sub-section 1: Revenue or Volume Breakdown
 Markdown table sorted by revenue or volume descending.
-Follow with 1–2 sentence insight naming any concentration risk.
+Follow with 2-3 sentences naming any concentration risk AND the mechanism
+behind it (e.g. why is this segment concentrated — pricing, demand, mix).
 
-Sub-section 2: Revenue per Unit / per Transaction (if applicable)
-Markdown table.
+Sub-section 2: Revenue per Unit / per Transaction
+Markdown table (required unless the analysis explicitly states no ratio
+was computable).
 Follow with 1–2 sentence insight explaining which items are
-premium vs high-volume-low-value.
+premium vs high-volume-low-value, and the implied customer behavior.
 
 ## Behavioral Patterns
-Answer these with specific numbers:
-- Which categories have high volume but low revenue — and what does that mean?
-- What cross-sell or upsell opportunities exist based on the data?
+Answer these with specific numbers, anchored against comparisons:
+- Which categories have high volume but low revenue — and what does the
+  ratio between them (not just the raw numbers) actually mean?
+- What cross-sell or upsell opportunities exist based on the data, with a
+  quantified stake if derivable?
 - What does the purchase or usage pattern suggest about customer behavior?
 
 ## Channel & Payment Breakdown
 Markdown table of revenue or volume by channel and/or payment method.
-1 sentence per table: is it balanced or concentrated, and what does that mean?
+1-2 sentences: is it balanced or concentrated, what's the mechanism, and
+what should the business do about it?
 
 ## Monthly Performance Trend
 Markdown table: Month | Revenue (or volume).
@@ -415,38 +486,46 @@ Follow with:
 - Is the overall trend growing, flat, or declining — based only on periods
   with enough data to be trustworthy? If not enough reliable history exists,
   say so plainly instead of forcing a trend claim.
-- What does the pattern suggest the business should do?
+- What does the pattern suggest the business should do this month?
 
 ## Top 5 Business Insights
 Numbered. Each insight:
-1. States an exact, reliable number
-2. Explains the business meaning in one sentence, with analyst judgment
-3. Names the specific opportunity or risk it creates
+1. States an exact, reliable number, anchored against a comparison point
+2. Names the underlying mechanism in one sentence — not just the pattern
+3. Names the specific opportunity or risk, with a quantified stake where
+   the analysis provides one
 
 ## Strategic Recommendations
 Exactly 5. Each in this format:
 
 **[Number]. [Action verb + what to do]**
-Based on: [exact metric]
+Based on: [exact metric, with its benchmark comparison]
 Action: [specific thing to do — e.g. "introduce coffee + cake bundle at checkout"]
-Expected outcome: [what business result this drives]
+Expected outcome: [QUANTIFIED — the $ or % stake, taken directly from the
+analysis findings; if the analysis only gave a qualitative stake, state
+that qualitative stake explicitly rather than inventing a number]
 
 ## Management Takeaway
 2–3 sentences only:
 - What is the overall business health?
 - What is the single most important action right now?
-- What will happen if it is acted on?
+- What will happen if it is acted on? (echo the quantified stake if one exists)
         """,
         agent=get_report_agent(),
         expected_output=(
-            "A clean business performance report with no mention of data, "
-            "cleaning, or quality issues (except a preserved row-retention "
-            "warning if one applies), and no unreliable/flagged percentage "
-            "claims. Contains: executive summary bullets, KPI table with analyst "
-            "judgment column, primary dimension breakdown tables with insights, "
-            "behavioral patterns grounded in numbers, channel/payment tables, "
-            "monthly trend table, 5 numbered insights, 5 concrete recommendations "
-            "each with action and expected outcome, and a management takeaway."
+            "A clean business performance report opening with a mandatory "
+            "'Bottom Line' section carried through from the analyst's BLUF, "
+            "followed by executive summary, KPI table with a benchmark "
+            "column, primary dimension breakdown tables (including a "
+            "per-unit ratio table) with mechanism-level insights, "
+            "behavioral patterns grounded in ratios not raw numbers, "
+            "channel/payment tables, monthly trend table, 5 numbered "
+            "insights each naming a mechanism, 5 concrete recommendations "
+            "each with a quantified expected outcome carried over from the "
+            "analysis (never diluted to vague language), and a management "
+            "takeaway — with no mention of data cleaning/quality issues "
+            "except a preserved row-retention warning if one applies, and "
+            "no unreliable/flagged percentage claims."
         ),
     )
 
@@ -471,10 +550,13 @@ Write a SHORT business performance paragraph for an executive dashboard —
 This is the first thing a business reader sees. It must:
 1. State what kind of business activity this data covers (1 sentence)
 2. Name the single most important RELIABLE performance finding with its
-   exact number (1 sentence) — check the sample-size guard fields below
-   before citing any percentage change
-3. Give ONE specific opportunity or action the business should take (1 sentence)
-4. Optionally name the biggest risk or watch item (1 sentence)
+   exact number, ANCHORED against a comparison point — average, prior
+   reliable period, or peer segment (1 sentence) — check the sample-size
+   guard fields below before citing any percentage change
+3. Give ONE specific opportunity or action the business should take, with
+   its quantified stake if derivable from the verified stats (1 sentence)
+4. Optionally name the biggest risk or watch item, including concentration
+   risk if one category dominates disproportionately (1 sentence)
 {retention_instruction}
 {DATA_RELIABILITY_RULES}
 
@@ -487,7 +569,8 @@ Rules:
 - Do not describe the dataset shape or column names
 - Never state a percentage change, trend, or before/after comparison that
   is null or flagged as insufficient/excluded in the verified statistics
-- Every sentence must be useful to a business reader
+- Every sentence must be useful to a business reader AND anchored — no
+  isolated numbers with nothing to compare them to
 
 Dataset name: {dataset_name}
 
@@ -500,8 +583,9 @@ Output ONLY the paragraph. No title, no "Summary:" prefix, no markdown.
         expected_output=(
             "A 3-5 sentence business performance paragraph: (if applicable) a "
             "brief row-retention note, what the business does, the top "
-            "RELIABLE performance finding with its exact number, one specific "
-            "opportunity or action, and optionally one risk. No unreliable "
-            "percentage claims. Plain prose only."
+            "RELIABLE performance finding with its exact number anchored "
+            "against a comparison point, one specific opportunity or action "
+            "with a quantified stake where derivable, and optionally one "
+            "risk. No unreliable percentage claims. Plain prose only."
         ),
     )
