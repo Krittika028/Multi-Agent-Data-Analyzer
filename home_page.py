@@ -181,19 +181,17 @@ if uploaded_file:
         st.error(f"File is {size_mb:.0f}MB — this deployment supports up to 300MB. Try filtering or sampling the data first.")
         st.stop()
 
-if uploaded_file:
     st.session_state.dataset_name = uploaded_file.name.rsplit(".", 1)[0]
-    
-if uploaded_file.name.endswith(".csv"):
-    lf = pl.scan_csv(uploaded_file)
-else:
-    # polars excel read is eager only, no lazy scan for xlsx
-    df = pl.read_excel(uploaded_file).to_pandas()
 
-if uploaded_file.name.endswith(".csv"):
-    # Only materialize what you need for preview — not the full file
-    preview_df = lf.head(20).collect().to_pandas()
-    df = lf.collect(streaming=True).to_pandas()
+    if uploaded_file.name.endswith(".csv"):
+        lf = pl.scan_csv(uploaded_file)
+        preview_df = lf.head(20).collect().to_pandas()
+        df = lf.collect(streaming=True).to_pandas()
+    else:
+        # polars excel read is eager only, no lazy scan for xlsx
+        df = pl.read_excel(uploaded_file).to_pandas()
+        preview_df = df.head(20)
+
     st.session_state.df_original = df
 
     none_count = sum((df == s).sum().sum() for s in ["None", "none", "NULL", "null", "nan", "NaN", "NA", "N/A"])
