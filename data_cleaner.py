@@ -118,23 +118,52 @@ MONTH_MAP = {
 _DATE_NOSPLIT_KEYWORDS = ['dob', 'birth', 'created_at', 'updated_at', 'modified', 'timestamp']
 
 # ── Domain-aware floor rules ───────────────────────────────────────────────────
-# Any numeric column whose name contains one of these keywords must be >= 0
+# Any numeric column whose name contains one of these keywords must be >= 0.
+# NOTE: this list intentionally EXCLUDES 'balance', 'credit', 'debit',
+# 'profit', 'loss', 'margin', 'refund', 'adjustment' — those can be
+# legitimately negative in banking/finance and retail contexts (an
+# overdrawn account, a refund/chargeback, a loss-making SKU, a credit
+# memo). Blanket-flooring those to 0 silently destroys real signal for
+# SMB finance and retail P&L use cases. See _SIGNED_ALLOWED_KEYWORDS.
 _NON_NEGATIVE_KEYWORDS = [
     'amount', 'price', 'cost', 'revenue', 'sales', 'fee', 'charge',
-    'payment', 'salary', 'wage', 'income', 'balance', 'loan', 'credit',
-    'debit', 'budget', 'profit', 'loss', 'tax', 'invoice', 'total',
+    'payment', 'salary', 'wage', 'income', 'loan', 'budget', 'tax',
+    'invoice', 'total', 'mrp', 'unit_price', 'subtotal', 'shipping',
     'time', 'duration', 'minutes', 'hours', 'days', 'age',
-    'count', 'quantity', 'qty', 'volume', 'units', 'stock',
+    'count', 'quantity', 'qty', 'volume', 'units', 'stock', 'inventory',
     'distance', 'weight', 'height',
 ]
 
+# Columns where negative values are legitimate business signal and must
+# NEVER be floored to 0 — e.g. an overdrawn bank balance, a refund /
+# chargeback amount, a loss-making product margin, a credit adjustment.
+# Checked FIRST in step9b/step10, before the keyword lists above/below.
+_SIGNED_ALLOWED_KEYWORDS = [
+    'balance', 'credit', 'debit', 'profit', 'loss', 'margin',
+    'refund', 'chargeback', 'adjustment', 'variance', 'delta',
+    'change', 'net',
+]
+
 # Rating/score columns: clip to [1, 5] unless the column name suggests a different range
-_RATING_KEYWORDS  = ['rating', 'score', 'stars', 'review_score', 'satisfaction']
+_RATING_KEYWORDS  = ['rating', 'score', 'stars', 'review_score', 'satisfaction', 'nps']
 _RATING_MIN, _RATING_MAX = 1.0, 5.0
 
-# Percentage columns: clip to [0, 100]
-_PERCENT_KEYWORDS = ['percent', 'pct', 'rate', 'discount', 'margin', 'utilization']
+# Percentage columns: clip to [0, 100]. 'margin' and 'rate' deliberately
+# excluded — a profit margin can be negative (loss-making) or exceed
+# 100% (markup math), and a generic "*_rate" column is too ambiguous
+# (interest rate, growth rate, error rate can all be negative or >100).
+# Handled as a signed/unbounded metric instead of a bounded percentage.
+_PERCENT_KEYWORDS = ['percent', 'pct', 'discount', 'utilization', 'conversion_rate', 'churn_rate']
 _PERCENT_MIN, _PERCENT_MAX = 0.0, 100.0
+
+# ── SMB domain keyword extensions — retail / e-commerce / banking ─────────────
+# Extra "identifier-like" keywords so corrupted-ID scrubbing (step8) also
+# catches the identifiers most common in these three domains for SMBs.
+_ID_LIKE_EXTRA_KEYWORDS = [
+    'sku', 'upc', 'ean', 'barcode', 'iban', 'ifsc', 'swift',
+    'account_number', 'card_number', 'routing_number', 'gstin', 'pan',
+    'order_number', 'invoice_number', 'tracking_number', 'awb',
+]
 
 # ── Row-loss safety thresholds for id-based dedup ──────────────────────────────
 _MIN_ID_UNIQUENESS_FOR_DEDUP = 0.95   # id column must be this unique pre-clean to be trusted
@@ -458,6 +487,10 @@ class DataCleaner:
     def __init__(self, df: pd.DataFrame):
         self.df             = df.copy()
         self.original_shape = df.shape
+        # Raw, untouched snapshot — kept purely for get_scorecard()'s
+        # "before" metrics, so the scorecard reflects the ACTUAL input
+        # data quality rather than a re-derived estimate.
+        self._raw_df        = df.copy()
         self.report         = []
         self.issues_found   = []
         self.fixes_applied  = []
@@ -469,6 +502,9 @@ class DataCleaner:
         # independent reporting-layer tripwire (see tasks.py).
         self.rows_before_dedup = None
         self.rows_after_dedup  = None
+        # Near-duplicate ROW pairs found during cleaning (populated by
+        # _detect_near_duplicate_rows(), called from clean()).
+        self._near_duplicate_rows = []
 
     # ── STEP 0: Drop user-selected columns ────────────────────────────────────
     def step0_drop_columns(self, columns_to_drop):
@@ -1150,8 +1186,21 @@ Your task:
     # ── STEP 8: Fix corrupted IDs ──────────────────────────────────────────────
     def step8_fix_corrupted_ids(self):
         fixed = 0
+        id_like_keywords = (
+            ['account', 'phone', 'mobile', 'zip', 'pin', 'contact']
+            + _ID_LIKE_EXTRA_KEYWORDS
+        )
         for col in self.df.columns:
-            if not any(k in col.lower() for k in ['account', 'phone', 'mobile', 'zip', 'pin', 'contact']):
+            if not any(k in col.lower() for k in id_like_keywords):
+                continue
+            # SKU/barcode/tracking-number style identifiers legitimately
+            # mix letters and digits (e.g. "SKU-A1023", "AWB1Z9992"), so the
+            # "strip anything non-numeric" rule below only applies to
+            # purely-numeric identifiers (accounts, phones, zips, cards).
+            if any(k in col.lower() for k in ['sku', 'upc', 'ean', 'barcode',
+                                               'iban', 'gstin', 'pan',
+                                               'order_number', 'invoice_number',
+                                               'tracking_number', 'awb']):
                 continue
             if self.df[col].dtype != object:
                 continue
@@ -1299,6 +1348,13 @@ Your task:
     def _simple_fill(self, col: str, missing_count: int, missing_pct: float, reason: str = ""):
         if pd.api.types.is_numeric_dtype(self.df[col]):
             fill_val = self.df[col].median()
+            # Nullable pandas integer dtypes (Int64/Int32/...) reject a
+            # non-integer fill value outright (e.g. a median of 1.5 for a
+            # ratings column) — this previously crashed the whole cleaning
+            # pipeline. Widen to float64 whenever the median isn't a whole
+            # number, so the fill always succeeds regardless of dtype.
+            if pd.api.types.is_extension_array_dtype(self.df[col].dtype) and fill_val % 1 != 0:
+                self.df[col] = self.df[col].astype("float64")
             self.df[col] = self.df[col].fillna(fill_val)
             self.report.append(
                 f"[IMPUTE] ⚠ '{col}': {missing_count} ({missing_pct}%) → median ({fill_val:,.2f}) [{reason}]"
@@ -1355,7 +1411,14 @@ Your task:
                     self.fixes_applied.append(f"Clipped '{col}' to [0%, 100%]")
                     clipped = True
 
-            # Non-negative columns
+            # Non-negative columns — skip entirely if the column name matches
+            # a signed-allowed keyword (balance, margin, refund, etc.), since
+            # negative values there are legitimate business signal, not
+            # data-quality errors (e.g. an overdrawn account, a loss-making
+            # product, a refund line item).
+            elif any(k in col_lower for k in _SIGNED_ALLOWED_KEYWORDS):
+                pass
+
             elif any(k in col_lower for k in _NON_NEGATIVE_KEYWORDS):
                 n_neg = int((self.df[col] < 0).sum())
                 if n_neg > 0:
@@ -1395,10 +1458,16 @@ Your task:
             lower = Q1 - 3 * IQR
             upper = Q3 + 3 * IQR
 
-            # For non-negative columns, never let the lower cap go below 0
-            is_non_negative = any(k in col_lower for k in _NON_NEGATIVE_KEYWORDS) or \
-                              any(k in col_lower for k in _RATING_KEYWORDS) or \
-                              any(k in col_lower for k in _PERCENT_KEYWORDS)
+            # For non-negative columns, never let the lower cap go below 0 —
+            # UNLESS the column is a signed-allowed metric (balance, margin,
+            # refund, credit, etc.), where a negative value is legitimate
+            # business signal, not an outlier artifact.
+            is_signed_allowed = any(k in col_lower for k in _SIGNED_ALLOWED_KEYWORDS)
+            is_non_negative = (not is_signed_allowed) and (
+                any(k in col_lower for k in _NON_NEGATIVE_KEYWORDS) or
+                any(k in col_lower for k in _RATING_KEYWORDS) or
+                any(k in col_lower for k in _PERCENT_KEYWORDS)
+            )
             if is_non_negative:
                 lower = max(lower, 0.0)
 
@@ -1472,6 +1541,233 @@ Your task:
         self.report.append(f"[VERDICT] {verdict}")
         return verdict
 
+    # ── Near-duplicate ROW detection (distinct from step7's fuzzy CELL merge) ──
+    def _detect_near_duplicate_rows(self, max_report=50):
+        """
+        Finds rows that are highly similar but NOT identical — e.g. a
+        re-keyed order with one typo'd field, or a customer entered twice
+        with a slightly different spelling. These are intentionally never
+        auto-removed (collapsing two genuinely distinct records is worse
+        than leaving a near-duplicate in place) — this is purely a
+        surfaced-for-review signal.
+
+        Approach: build a normalized text signature per row from its
+        text/categorical columns, then reuse the same bounded edit-distance
+        clustering as step7's fuzzy merge (capped by
+        _MAX_FUZZY_UNIQUE_VALUES for performance on large/high-cardinality
+        datasets).
+        """
+        self._near_duplicate_rows = []
+        if len(self.df) < 2:
+            return
+
+        text_cols = [
+            c for c in self.df.columns
+            if self.df[c].dtype == object and not c.endswith("_month_name")
+        ][:6]
+        if not text_cols:
+            return
+
+        work_df = self.df
+        if len(work_df) > 5000:
+            work_df = work_df.sample(5000, random_state=42)
+
+        signatures = (
+            work_df[text_cols].fillna("").astype(str)
+            .agg(" ".join, axis=1)
+            .apply(_normalize_text)
+        )
+
+        unique_sigs = signatures.unique().tolist()
+        if len(unique_sigs) > _MAX_FUZZY_UNIQUE_VALUES:
+            return  # too expensive to compare pairwise — skip, not worth blocking cleaning
+
+        # Cluster similar (but non-identical) signatures using the same
+        # relative edit-distance rule as _build_canonical_map.
+        clusters: dict = {}
+        seen_norms = []
+        for sig in unique_sigs:
+            if not sig:
+                continue
+            matched_to = None
+            for known in seen_norms:
+                if known == sig:
+                    continue
+                dist = _edit_distance(sig, known)
+                max_len = max(len(sig), len(known))
+                if max_len == 0:
+                    continue
+                relative_threshold = 0.20 if max_len <= 6 else 0.15
+                if dist > 0 and dist <= 3 and (dist / max_len) <= relative_threshold:
+                    matched_to = known
+                    break
+            if matched_to:
+                clusters.setdefault(matched_to, [matched_to]).append(sig)
+            else:
+                seen_norms.append(sig)
+
+        preview_cols = text_cols + [
+            c for c in self.df.columns
+            if pd.api.types.is_numeric_dtype(self.df[c])
+        ][:3]
+
+        for canonical_sig, group_sigs in clusters.items():
+            matching_rows = work_df[signatures.isin(group_sigs)]
+            if len(matching_rows) < 2:
+                continue
+            for _, row in matching_rows.head(max_report).iterrows():
+                record = row[preview_cols].to_dict()
+                record["_row_index"] = row.name
+                self._near_duplicate_rows.append(record)
+            if len(self._near_duplicate_rows) >= max_report:
+                break
+
+    def get_near_duplicates(self) -> list:
+        """Returns the near-duplicate row records found during clean()."""
+        return self._near_duplicate_rows
+
+    # ── Column profile / classification accessors (for domain_detector.py) ────
+    def get_profile(self) -> dict:
+        """
+        Per-column profile of the CLEANED dataframe — consumed by
+        DomainDetector as evidence for its domain-guess reasoning.
+        Dataset-agnostic: works identically on retail, e-commerce,
+        banking, or any other domain's columns.
+        """
+        profile = {}
+        for col in self.df.columns:
+            s = self.df[col]
+            non_null = s.dropna()
+            profile[col] = {
+                "dtype": str(s.dtype),
+                "n_unique": int(non_null.nunique()) if len(non_null) else 0,
+                "missing_pct": round(float(s.isnull().mean() * 100), 1),
+                "sample_values": non_null.astype(str).unique()[:5].tolist(),
+            }
+        return profile
+
+    def get_classification(self) -> dict:
+        """
+        Per-column role classification — "id" / "numeric" / "datetime" /
+        "categorical" / "text". Prefers the LLM's dtype call from step6
+        (self._llm_dtypes) when available, falls back to dtype-based
+        heuristics otherwise, so this never returns empty even if the LLM
+        was unavailable during cleaning.
+        """
+        classification = {}
+        for col in self.df.columns:
+            s = self.df[col]
+            llm_type = self._llm_dtypes.get(col, "").lower() if self._llm_dtypes else ""
+            if llm_type in ("id", "numeric", "datetime", "categorical", "text"):
+                classification[col] = llm_type
+                continue
+
+            col_lower = col.lower()
+            if col_lower.endswith("_id") or col_lower == "id" or \
+               any(k in col_lower for k in _ID_LIKE_EXTRA_KEYWORDS):
+                classification[col] = "id"
+            elif pd.api.types.is_datetime64_any_dtype(s):
+                classification[col] = "datetime"
+            elif pd.api.types.is_numeric_dtype(s):
+                classification[col] = "numeric"
+            elif s.dropna().nunique() <= 60:
+                classification[col] = "categorical"
+            else:
+                classification[col] = "text"
+        return classification
+
+    # ── Data-health scorecard (for the Data Cleaner page's UI metrics) ─────────
+    def get_scorecard(self) -> dict:
+        """
+        Computes 4 dimensions of data quality, BEFORE (raw upload) vs
+        AFTER (cleaned) — completeness, uniqueness, validity, consistency —
+        plus an overall letter grade, so SMB users get an at-a-glance
+        health readout without needing to read the full text log.
+        """
+
+        def _completeness(df):
+            total_cells = df.shape[0] * df.shape[1] if df.shape[1] else 1
+            return round(float(100 - (df.isnull().sum().sum() / total_cells * 100)), 1)
+
+        def _uniqueness(df):
+            if len(df) == 0:
+                return 100.0
+            dupes = int(df.duplicated().sum())
+            return round(100 - (dupes / len(df) * 100), 1)
+
+        def _validity(df):
+            # % of object-column cells that are NOT a recognized null-marker
+            # string (garbage tokens like "ERROR", "N/A", "#DIV/0!", etc.) —
+            # a proxy for how much of the raw text data was well-formed.
+            obj_cols = df.select_dtypes(include="object").columns
+            if len(obj_cols) == 0:
+                return 100.0
+            total = invalid = 0
+            for col in obj_cols:
+                s = df[col].dropna().astype(str).str.strip()
+                total += len(s)
+                invalid += int(s.str.lower().isin(_NULL_STRINGS_LOWER).sum())
+            if total == 0:
+                return 100.0
+            return round(100 - (invalid / total * 100), 1)
+
+        def _consistency(df):
+            # % of categorical columns (<=60 uniques) whose values are
+            # already Title Case + free of stray whitespace/special chars —
+            # a proxy for formatting consistency across categories.
+            cat_cols = [
+                c for c in df.select_dtypes(include="object").columns
+                if df[c].dropna().nunique() <= 60
+            ]
+            if not cat_cols:
+                return 100.0
+            consistent = 0
+            for col in cat_cols:
+                vals = df[col].dropna().astype(str)
+                if len(vals) == 0:
+                    consistent += 1
+                    continue
+                well_formed = vals.apply(
+                    lambda v: v == v.title() and v == v.strip() and not re.search(r'\s{2,}', v)
+                )
+                if well_formed.mean() >= 0.9:
+                    consistent += 1
+            return round(consistent / len(cat_cols) * 100, 1)
+
+        def _grade(avg_score):
+            if avg_score >= 95: return "A"
+            if avg_score >= 85: return "B"
+            if avg_score >= 70: return "C"
+            if avg_score >= 50: return "D"
+            return "F"
+
+        def _score_block(df):
+            completeness = _completeness(df)
+            uniqueness   = _uniqueness(df)
+            validity     = _validity(df)
+            consistency  = _consistency(df)
+            avg = (completeness + uniqueness + validity + consistency) / 4
+            return {
+                "completeness_pct": completeness,
+                "uniqueness_pct":   uniqueness,
+                "validity_pct":     validity,
+                "consistency_pct":  consistency,
+                "grade":            _grade(avg),
+                "_avg":             avg,
+            }
+
+        before = _score_block(self._raw_df)
+        after  = _score_block(self.df)
+        delta_points = round(float(after["_avg"] - before["_avg"]), 1)
+
+        before.pop("_avg"); after.pop("_avg")
+
+        return {
+            "before": before,
+            "after": after,
+            "delta_points": delta_points,
+        }
+
     # ── Row-retention accessor (for crew.py's independent tripwire) ────────────
     def get_row_retention(self) -> dict:
         """
@@ -1498,6 +1794,7 @@ Your task:
         self.step2_convert_nulls_to_nan()
         self.step3_check_missing()
         self.step4_remove_duplicates()
+        self._detect_near_duplicate_rows()
         self.step5_fix_currency()
         self.step6_fix_data_types()
         self.step6b_split_dates()
