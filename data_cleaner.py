@@ -1231,24 +1231,6 @@ Your task:
                 or (pd.api.types.is_numeric_dtype(self.df[col]) and self.df[col].nunique() <= 10)
             )
 
-            # ── GUARD: a "categorical" column whose values are mostly
-            # unique (free text like notes/feedback, emails, near-ID
-            # fields) is not a real classification target — fitting an RF
-            # Classifier against thousands of near-unique labels is both
-            # meaningless and, on real datasets, slow/expensive enough to
-            # time out the whole cleaning run. Route these to a cheap
-            # fallback instead of training a model on them.
-            if is_cat and col in self._encoders:
-                known_vals = self.df[col].dropna()
-                cardinality_ratio = known_vals.nunique() / max(len(known_vals), 1)
-                if known_vals.nunique() > 50 or cardinality_ratio > 0.5:
-                    self._simple_fill(
-                        col, missing_count, missing_pct,
-                        reason="high-cardinality/free-text — not a valid classification target",
-                    )
-                    self._imputed_cols.add(col)
-                    continue
-
             try:
                 model = (
                     RandomForestClassifier(n_estimators=150, max_depth=10, random_state=42, n_jobs=-1)
