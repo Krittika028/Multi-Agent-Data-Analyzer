@@ -144,9 +144,23 @@ _SIGNED_ALLOWED_KEYWORDS = [
     'change', 'net',
 ]
 
-# Rating/score columns: clip to [1, 5] unless the column name suggests a different range
+# Rating/score columns — bounds are now INFERRED per-dataset (see
+# _infer_rating_scale below) instead of hardcoded to a single [1,5]
+# scale. A dataset may legitimately use a 1-5, 1-10, 0-10, 1-50, 1-100,
+# NPS (-100 to 100 or 0-10), or any other scale — hardcoding [1,5]
+# silently corrupted every other scale (e.g. a 1-100 satisfaction score
+# got clipped down to 5). _RATING_MIN/_RATING_MAX below remain only as
+# a last-resort fallback when a column can't be observed at all
+# (e.g. 100% missing before imputation).
 _RATING_KEYWORDS  = ['rating', 'score', 'stars', 'review_score', 'satisfaction', 'nps']
 _RATING_MIN, _RATING_MAX = 1.0, 5.0
+# Canonical "nice" scale ceilings a real-world rating/score column is
+# likely to actually use. Observed data is snapped UP to the smallest
+# candidate that comfortably contains it, e.g. an observed max of 4.8
+# snaps to 5, an observed max of 47 snaps to 50, an observed max of 8.5
+# snaps to 10. If the observed max exceeds every candidate, the
+# observed max itself (padded) is used instead of guessing.
+_RATING_SCALE_CANDIDATES = [5.0, 10.0, 50.0, 100.0]
 
 # Percentage columns: clip to [0, 100]. 'margin' and 'rate' deliberately
 # excluded — a profit margin can be negative (loss-making) or exceed
@@ -444,6 +458,75 @@ def _parse_month_year_string(val: str):
     return None
 
 
+def _keyword_word_match(col_lower: str, keywords) -> bool:
+    """
+    Word-boundary keyword match for column names — replaces naive
+    substring `in` checks that produced false positives like
+    'at' in 'order_rating' (matches inside "r-AT-ing") or 'on' in
+    'promotion'. A keyword only counts as a match if it isn't glued to
+    another letter/digit on either side (underscores/spaces/start/end
+    are OK boundaries, letters/digits are not).
+    """
+    for k in keywords:
+        if re.search(r'(?<![a-z0-9])' + re.escape(k) + r'(?![a-z0-9])', col_lower):
+            return True
+    return False
+
+
+# Columns whose name may contain a technically-matching date keyword
+# (most commonly "time") but which actually represent a DURATION /
+# INTERVAL, not a point-in-time timestamp — e.g. "delivery_time_mins",
+# "handling_time_hours", "response_time_secs". These must never be
+# date-parsed regardless of keyword match.
+_DURATION_UNIT_KEYWORDS = [
+    'mins', 'minute', 'minutes', 'min', 'hrs', 'hour', 'hours',
+    'secs', 'second', 'seconds', 'sec', 'days_taken', 'duration',
+    'elapsed', 'taken', 'turnaround', 'ttl', 'latency', 'delay',
+]
+
+
+def _is_duration_not_date(col_lower: str) -> bool:
+    return _keyword_word_match(col_lower, _DURATION_UNIT_KEYWORDS)
+
+
+def _sample_looks_datelike(non_null: pd.Series) -> bool:
+    """
+    Structural content guard, independent of the column name: only
+    treat a column as date-parseable if a majority of its actual
+    values look like dates (contain a date separator, a colon, a
+    4-digit year, or a month name) — NOT bare numbers like "16" or
+    "1.4". This exists because the row-wise dateutil fallback in
+    _try_parse_date_column is extremely lenient and will happily
+    misinterpret a plain rating/duration number as a day or 2-digit
+    year, silently filling the rest of the date from *today's* date.
+    That's what previously turned order_rating (1.4, 3.2, ...) and
+    delivery_time_mins (16, 47, 69, ...) into garbage timestamps.
+    """
+    sample = non_null.astype(str).str.strip().head(30)
+    if sample.empty:
+        return False
+
+    # A bare integer/decimal with no other characters (optionally with
+    # a leading -) is never a plausible date token on its own.
+    bare_number = re.compile(r'^-?\d+(\.\d+)?$')
+    date_signal = re.compile(
+        r'[-/]|:|,|\b\d{4}\b|'
+        r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b',
+        re.IGNORECASE,
+    )
+
+    n = len(sample)
+    bare_numeric_count = sample.apply(lambda v: bool(bare_number.match(v))).sum()
+    if bare_numeric_count / n >= 0.5:
+        # Column is mostly plain numbers — that's a numeric/rating/
+        # duration column, not a date column, no matter what the
+        # column name looks like.
+        return False
+
+    hits = sample.apply(lambda v: bool(date_signal.search(v))).sum()
+    return (hits / n) >= 0.6
+
+
 def _column_has_month_names(series: pd.Series) -> bool:
     sample = series.dropna().astype(str).head(20)
     pattern = re.compile(
@@ -460,6 +543,18 @@ def _try_parse_date_column(series: pd.Series) -> pd.Series:
     non_null = series.dropna()
     if len(non_null) == 0:
         return None
+
+    # SAFETY GATE (fixes the order_rating/delivery_time_mins bug): only
+    # proceed if the values themselves structurally look like dates.
+    # Without this, the lenient dateutil fallback further down happily
+    # turns bare numbers (ratings, minute counts, ids, ...) into fake
+    # dates by filling in whatever date parts are "missing" from
+    # today's date — e.g. rating 1.4 -> 2026-07-01, delivery time 47
+    # -> year 2047. This one check protects every caller of this
+    # function (step6, step6b's rescue pass, etc.) at a single point.
+    if not _sample_looks_datelike(non_null):
+        return None
+
     try:
         numeric = pd.to_numeric(series, errors='coerce')
         unix_mask = numeric.notna() & (numeric > 1e9) & (numeric < 2e10)
@@ -557,6 +652,12 @@ class DataCleaner:
         self._llm_dtypes    = {}
         # Track which columns came from imputation (for post-clip)
         self._imputed_cols  = set()
+        # Per-column inferred (min, max) bounds for rating/score columns,
+        # populated by _infer_rating_scales() from the OBSERVED data
+        # before imputation/outlier-capping can distort it. Replaces the
+        # old one-size-fits-all [1,5] hardcode so a 1-10, 0-10, 1-50,
+        # 1-100, or any other scale is respected automatically.
+        self._rating_bounds = {}
         # Row-retention bookkeeping — surfaced to crew.py for the
         # independent reporting-layer tripwire (see tasks.py).
         self.rows_before_dedup = None
@@ -824,14 +925,18 @@ class DataCleaner:
                 continue
 
             date_keywords = [
-                'date', 'time', 'dt', 'created', 'updated', 'at', '_on',
+                'date', 'time', 'dt', 'created', 'updated', 'at', 'on',
                 'day', 'month', 'year', 'dob', 'birth', 'timestamp',
                 'period', 'transaction_date', 'invoice_date', 'order_date',
             ]
+            col_lower = col.lower()
             is_datetime_candidate = (
-                llm_type == "datetime"
-                or any(k in col.lower() for k in date_keywords)
-                or _column_has_month_names(non_null)
+                not _is_duration_not_date(col_lower)
+                and (
+                    llm_type == "datetime"
+                    or _keyword_word_match(col_lower, date_keywords)
+                    or _column_has_month_names(non_null)
+                )
             )
 
             if is_datetime_candidate:
@@ -864,22 +969,37 @@ class DataCleaner:
             non_null = self.df[col].dropna()
             if len(non_null) == 0:
                 continue
+
+            # NUMERIC-FIRST GUARD (mirrors step6): a column that is
+            # still object dtype here but is actually mostly clean
+            # numbers (a rating, a duration, an id that slipped through)
+            # must never be "rescued" into a date just because its name
+            # happens to contain a date-ish word. Convert it to numeric
+            # instead and skip date rescue entirely.
+            numeric_probe = _clean_numeric_string(non_null)
+            if numeric_probe.notna().sum() / len(non_null) > 0.50:
+                continue
+
+            col_lower = col.lower()
             date_keywords = [
-                'date', 'time', 'dt', 'created', 'updated', 'at', '_on',
+                'date', 'time', 'dt', 'created', 'updated', 'at', 'on',
                 'day', 'month', 'year', 'dob', 'birth', 'timestamp',
                 'period', 'transaction_date', 'invoice_date', 'order_date',
             ]
             sample_str = non_null.astype(str).head(20)
             looks_like_date = (
-                any(k in col.lower() for k in date_keywords)
-                or _column_has_month_names(non_null)
-                or sample_str.str.match(
-                    r'^\d{4}-\d{2}-\d{2}'
-                    r'|^\d{2}-\d{2}-\d{4}'
-                    r'|^\d{2}/\d{2}/\d{4}'
-                    r'|^\d{4}/\d{2}/\d{2}'
-                    r'|^\d{8}$'
-                ).sum() >= 3
+                not _is_duration_not_date(col_lower)
+                and (
+                    _keyword_word_match(col_lower, date_keywords)
+                    or _column_has_month_names(non_null)
+                    or sample_str.str.match(
+                        r'^\d{4}-\d{2}-\d{2}'
+                        r'|^\d{2}-\d{2}-\d{4}'
+                        r'|^\d{2}/\d{2}/\d{4}'
+                        r'|^\d{4}/\d{2}/\d{2}'
+                        r'|^\d{8}$'
+                    ).sum() >= 3
+                )
             )
             if looks_like_date:
                 parsed = _try_parse_date_column(self.df[col])
@@ -1469,14 +1589,70 @@ Your task:
             )
 
     # ── STEP 9b: Post-imputation domain-aware clipping ─────────────────────────
+    def _infer_rating_scales(self):
+        """
+        Infers the ACTUAL scale each rating/score-like column uses from
+        its own observed (non-null, pre-imputation, pre-outlier-cap)
+        values — instead of assuming every such column is a 1-5 star
+        rating. Handles 1-5, 0-5, 1-10, 0-10, 1-50, 1-100, NPS-style
+        0-10, or anything else, and degrades gracefully (falls back to
+        the classic 1-5 default) if a column has no usable data yet.
+
+        Must run AFTER dtypes are finalized (numeric) but BEFORE RF
+        imputation / outlier capping, so the inferred scale reflects
+        genuine user-entered values, not model-predicted or already-
+        clipped ones.
+        """
+        for col in self.df.select_dtypes(include=[np.number]).columns:
+            col_lower = col.lower()
+            if not _keyword_word_match(col_lower, _RATING_KEYWORDS):
+                continue
+
+            observed = self.df[col].dropna()
+            if len(observed) == 0:
+                self._rating_bounds[col] = (_RATING_MIN, _RATING_MAX)
+                continue
+
+            obs_min = float(observed.min())
+            obs_max = float(observed.max())
+
+            # Lower bound: most rating scales start at 0 or 1. Trust 0
+            # only if it's actually present in the data (or negative
+            # values appear, e.g. an NPS-style column); otherwise
+            # default to 1, the far more common convention.
+            inferred_min = 0.0 if obs_min <= 0 else 1.0
+
+            # Upper bound: snap UP to the smallest "nice" scale ceiling
+            # that comfortably contains the observed max, so a handful
+            # of values near the top of a 1-10 scale don't get
+            # misread as a 1-100 scale (or vice versa). If the observed
+            # max exceeds every canonical candidate, trust the data and
+            # pad it slightly instead of guessing.
+            inferred_max = next(
+                (c for c in _RATING_SCALE_CANDIDATES if obs_max <= c),
+                round(obs_max * 1.1, 1) if obs_max > 0 else _RATING_MAX,
+            )
+
+            self._rating_bounds[col] = (inferred_min, inferred_max)
+            self.report.append(
+                f"[SCALE] ℹ '{col}': inferred rating scale "
+                f"[{inferred_min:g}, {inferred_max:g}] from observed data "
+                f"(min={obs_min:g}, max={obs_max:g})"
+            )
+
     def step9b_post_imputation_clip(self):
         """
         After RF imputation, clamp columns whose values must stay within
         known physical/business bounds. This prevents RF producing
-        impossible values like negative order amounts or ratings of 8.5.
+        impossible values like negative order amounts or an 8.5 on a
+        rating scale that tops out at 5.
 
         Rules (generalized for any dataset):
-          - Rating/score columns   → clip to [1.0, 5.0]
+          - Rating/score columns   → clip to their INFERRED scale
+                                      (see _infer_rating_scales — adapts
+                                      to 1-5, 1-10, 1-50, 1-100, etc.,
+                                      instead of assuming 1-5 for every
+                                      dataset)
           - Percentage columns     → clip to [0.0, 100.0]
           - Non-negative keywords  → floor at 0.0
         """
@@ -1485,19 +1661,23 @@ Your task:
             col_lower = col.lower()
             clipped   = False
 
-            # Rating columns
-            if any(k in col_lower for k in _RATING_KEYWORDS):
-                n_bad = int(((self.df[col] < _RATING_MIN) | (self.df[col] > _RATING_MAX)).sum())
+            # Rating columns — use this dataset's own inferred scale,
+            # falling back to the classic 1-5 default only if inference
+            # never ran / found nothing for this column.
+            if _keyword_word_match(col_lower, _RATING_KEYWORDS):
+                rating_min, rating_max = self._rating_bounds.get(col, (_RATING_MIN, _RATING_MAX))
+                n_bad = int(((self.df[col] < rating_min) | (self.df[col] > rating_max)).sum())
                 if n_bad > 0:
-                    self.df[col] = self.df[col].clip(_RATING_MIN, _RATING_MAX)
+                    self.df[col] = self.df[col].clip(rating_min, rating_max)
                     self.report.append(
-                        f"[CLIP] ✅ '{col}': {n_bad} out-of-range value(s) clipped to [{_RATING_MIN}, {_RATING_MAX}]"
+                        f"[CLIP] ✅ '{col}': {n_bad} out-of-range value(s) clipped to "
+                        f"[{rating_min:g}, {rating_max:g}] (dataset's inferred scale)"
                     )
-                    self.fixes_applied.append(f"Clipped '{col}' to [{_RATING_MIN}, {_RATING_MAX}]")
+                    self.fixes_applied.append(f"Clipped '{col}' to [{rating_min:g}, {rating_max:g}]")
                     clipped = True
 
             # Percentage columns
-            elif any(k in col_lower for k in _PERCENT_KEYWORDS):
+            elif _keyword_word_match(col_lower, _PERCENT_KEYWORDS):
                 n_bad = int(((self.df[col] < _PERCENT_MIN) | (self.df[col] > _PERCENT_MAX)).sum())
                 if n_bad > 0:
                     self.df[col] = self.df[col].clip(_PERCENT_MIN, _PERCENT_MAX)
@@ -1512,10 +1692,10 @@ Your task:
             # negative values there are legitimate business signal, not
             # data-quality errors (e.g. an overdrawn account, a loss-making
             # product, a refund line item).
-            elif any(k in col_lower for k in _SIGNED_ALLOWED_KEYWORDS):
+            elif _keyword_word_match(col_lower, _SIGNED_ALLOWED_KEYWORDS):
                 pass
 
-            elif any(k in col_lower for k in _NON_NEGATIVE_KEYWORDS):
+            elif _keyword_word_match(col_lower, _NON_NEGATIVE_KEYWORDS):
                 n_neg = int((self.df[col] < 0).sum())
                 if n_neg > 0:
                     self.df[col] = self.df[col].clip(lower=0)
@@ -1558,14 +1738,26 @@ Your task:
             # UNLESS the column is a signed-allowed metric (balance, margin,
             # refund, credit, etc.), where a negative value is legitimate
             # business signal, not an outlier artifact.
-            is_signed_allowed = any(k in col_lower for k in _SIGNED_ALLOWED_KEYWORDS)
+            is_signed_allowed = _keyword_word_match(col_lower, _SIGNED_ALLOWED_KEYWORDS)
+            is_rating_col = _keyword_word_match(col_lower, _RATING_KEYWORDS)
             is_non_negative = (not is_signed_allowed) and (
-                any(k in col_lower for k in _NON_NEGATIVE_KEYWORDS) or
-                any(k in col_lower for k in _RATING_KEYWORDS) or
-                any(k in col_lower for k in _PERCENT_KEYWORDS)
+                _keyword_word_match(col_lower, _NON_NEGATIVE_KEYWORDS) or
+                is_rating_col or
+                _keyword_word_match(col_lower, _PERCENT_KEYWORDS)
             )
             if is_non_negative:
                 lower = max(lower, 0.0)
+
+            # Rating columns additionally never get an IQR upper cap
+            # above their own inferred scale ceiling — an IQR-based
+            # upper bound computed on, say, a tight cluster of 4s and 5s
+            # could otherwise sit below the column's real max (e.g. a
+            # legitimate 10 on a 1-10 scale), or conversely allow values
+            # above the real scale ceiling through as "not outliers".
+            if is_rating_col and col in self._rating_bounds:
+                _, rating_max = self._rating_bounds[col]
+                upper = min(upper, rating_max) if upper > rating_max else upper
+                lower = max(lower, self._rating_bounds[col][0])
 
             n_capped = int(((self.df[col] < lower) | (self.df[col] > upper)).sum())
             if n_capped > 0:
@@ -1897,6 +2089,10 @@ Your task:
         self.step7_standardize_categoricals()
         self._sweep_nulls_again()
         self.step12_final_dtype_audit()
+        # Must run AFTER dtypes are finalized (so rating columns are
+        # numeric) but BEFORE imputation/outlier-capping, so the scale
+        # is learned from genuine observed values, not model output.
+        self._infer_rating_scales()
         self.step8_fix_corrupted_ids()
         self.step9_rf_impute_missing()
         self.step9b_post_imputation_clip()   
