@@ -175,6 +175,52 @@ _MAX_FUZZY_UNIQUE_VALUES = 500   # above this, skip pairwise edit-distance merge
 # ── RF imputation performance cap ───────────────────────────────────────────────
 _MAX_RF_TRAIN_ROWS = 20_000      # sample down to this many rows per column fit on large datasets
 
+# ── LLM call safety caps (this version) ─────────────────────────────────────────
+# Every LLM call in this file previously had no request timeout and could be
+# retried by nothing but a bare try/except — a single slow/hanging endpoint
+# could stall the ENTIRE cleaning pipeline indefinitely, which on Streamlit
+# Cloud shows up as the platform killing the app with a generic "Received no
+# response from server" error (no Python traceback is produced, because the
+# process is still "running", just stuck).
+#
+# Fixes:
+#   1. Every litellm.completion() call in this file now passes an explicit
+#      `timeout=` so a hung request fails fast instead of hanging forever.
+#   2. step7's per-COLUMN canonical-mapping LLM call (previously unbounded —
+#      one call per categorical column, however many that is) is now capped
+#      at _MAX_LLM_CANONICAL_CALLS total calls per clean() run. Columns
+#      beyond the cap fall back to the deterministic Title Case + fuzzy
+#      edit-distance merge — the same graceful path already used whenever
+#      the LLM call fails, just bounded proactively instead of only
+#      reactively (after already burning the time on the call).
+#   3. A column's unique-value list is only sent to the canonical-mapping
+#      LLM call if it's small enough to answer quickly/cheaply
+#      (_MAX_LLM_CANONICAL_UNIQUE_VALS) — a very high-cardinality column
+#      goes straight to the deterministic fuzzy merge instead.
+_LLM_TIMEOUT_SECONDS            = 20   # hard per-call timeout — fail fast, don't hang the pipeline
+_MAX_LLM_CANONICAL_CALLS        = 12   # total step7 LLM canonicalization calls allowed per clean() run
+_MAX_LLM_CANONICAL_UNIQUE_VALS  = 150  # skip the LLM call for columns with more uniques than this
+
+# ── Date-parsing performance cap ────────────────────────────────────────────────
+# The final fallback in _try_parse_date_column() parses every value
+# one-at-a-time with dateutil — fine for a few thousand rows, but on a
+# 100K+ row column where none of the fast vectorized/format attempts hit
+# the 75% threshold, this row-by-row pass can take minutes by itself. Above
+# this row count, skip the row-by-row fallback entirely (the column is left
+# as text rather than the app burning minutes on it) — the vectorized
+# attempts above already give this every reasonable shot first.
+_MAX_ROWS_FOR_ROWWISE_DATE_PARSE = 20_000
+
+# ── RF imputation total-time-budget cap ─────────────────────────────────────────
+# n_estimators=150 per RF fit is fine for one or two columns, but a wide
+# dataset with many missing columns fits one full forest PER column,
+# sequentially. Above this many columns needing RF imputation, later
+# columns automatically use a cheaper forest (fewer trees) so total
+# clean() time stays roughly bounded regardless of dataset width.
+_RF_CHEAP_MODE_AFTER_N_COLUMNS = 6
+_RF_ESTIMATORS_NORMAL = 150
+_RF_ESTIMATORS_CHEAP  = 60
+
 
 # ── Fuzzy near-duplicate merging ───────────────────────────────────────────────
 
@@ -284,6 +330,7 @@ No explanation, no markdown, no extra text.
             messages=[{"role": "user", "content": prompt}],
             max_tokens=600,
             temperature=0,
+            timeout=_LLM_TIMEOUT_SECONDS,
         )
         raw = response.choices[0].message.content.strip()
         raw = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
@@ -351,7 +398,8 @@ def _detect_dayfirst(series: pd.Series) -> bool:
                       f"Sample: {json.dumps(sample.head(15).tolist())}\n"
                       f'Respond with ONLY: "dayfirst" or "monthfirst".')
             resp = litellm.completion(model=model, api_key=api_key,
-                messages=[{"role": "user", "content": prompt}], max_tokens=10, temperature=0)
+                messages=[{"role": "user", "content": prompt}], max_tokens=10, temperature=0,
+                timeout=_LLM_TIMEOUT_SECONDS)
             return "dayfirst" in resp.choices[0].message.content.strip().lower()
     except Exception:
         pass
@@ -449,6 +497,17 @@ def _try_parse_date_column(series: pd.Series) -> pd.Series:
         except Exception:
             continue
 
+    # PERFORMANCE GUARD: the row-by-row dateutil fallback below is a Python-
+    # level loop over every value. On a 100K+ row column that didn't parse
+    # cleanly with any of the fast vectorized/format attempts above, this
+    # can take minutes on its own and is the kind of thing that makes an
+    # app just hang with no error — exactly what shows up on Streamlit
+    # Cloud as "Received no response from server". Above the row cap, skip
+    # it: the column is left unparsed (stays text) rather than the pipeline
+    # silently burning minutes trying to save it value-by-value.
+    if len(non_null) > _MAX_ROWS_FOR_ROWWISE_DATE_PARSE:
+        return None
+
     def _parse_single(val):
         if pd.isnull(val):
             return pd.NaT
@@ -505,6 +564,9 @@ class DataCleaner:
         # Near-duplicate ROW pairs found during cleaning (populated by
         # _detect_near_duplicate_rows(), called from clean()).
         self._near_duplicate_rows = []
+        # Budget counter for step7's per-column LLM canonicalization calls —
+        # see _MAX_LLM_CANONICAL_CALLS. Reset per clean() run.
+        self._llm_canonical_calls_used = 0
 
     # ── STEP 0: Drop user-selected columns ────────────────────────────────────
     def step0_drop_columns(self, columns_to_drop):
@@ -958,6 +1020,7 @@ Your task:
                     messages=[{"role": "user", "content": prompt}],
                     max_tokens=800,
                     temperature=0,
+                    timeout=_LLM_TIMEOUT_SECONDS,
                 )
                 raw = resp.choices[0].message.content.strip()
                 raw = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
@@ -1053,12 +1116,27 @@ Your task:
                 fixed += 1
                 continue
 
-            # Phase 3: LLM canonical mapping
+            # Phase 3: LLM canonical mapping — bounded so a wide dataset
+            # (many categorical columns) can't turn into dozens of
+            # sequential network calls that stall the whole pipeline.
             current_non_null = self.df[col].dropna()
             raw_unique       = current_non_null.unique().tolist()
 
-            llm_map  = _llm_canonical_map(col, raw_unique)
+            llm_map  = {}
             llm_used = False
+            can_use_llm = (
+                self._llm_canonical_calls_used < _MAX_LLM_CANONICAL_CALLS
+                and len(raw_unique) <= _MAX_LLM_CANONICAL_UNIQUE_VALS
+            )
+            if can_use_llm:
+                self._llm_canonical_calls_used += 1
+                llm_map = _llm_canonical_map(col, raw_unique)
+            elif self._llm_canonical_calls_used >= _MAX_LLM_CANONICAL_CALLS:
+                self.report.append(
+                    f"[LLM-CLEAN] ⚠ '{col}': skipped LLM canonicalization — "
+                    f"reached the {_MAX_LLM_CANONICAL_CALLS}-call budget for this run "
+                    f"(deterministic Title Case + fuzzy merge still applied below)"
+                )
 
             if llm_map:
                 valid_llm_map = {
@@ -1280,11 +1358,24 @@ Your task:
                 or (pd.api.types.is_numeric_dtype(self.df[col]) and self.df[col].nunique() <= 10)
             )
 
+            # WIDE-DATASET GUARD: n_estimators=150 per column is fine for a
+            # couple of columns, but a dataset with many missing columns
+            # fits one full forest PER column, sequentially — that stacks
+            # up fast and is a common cause of the pipeline just running
+            # for minutes with nothing visibly wrong. After the first
+            # _RF_CHEAP_MODE_AFTER_N_COLUMNS columns, later columns use a
+            # smaller forest so total imputation time stays bounded
+            # regardless of how many columns need it.
+            n_estimators = (
+                _RF_ESTIMATORS_NORMAL
+                if len(self._imputed_cols) < _RF_CHEAP_MODE_AFTER_N_COLUMNS
+                else _RF_ESTIMATORS_CHEAP
+            )
             try:
                 model = (
-                    RandomForestClassifier(n_estimators=150, max_depth=10, random_state=42, n_jobs=-1)
+                    RandomForestClassifier(n_estimators=n_estimators, max_depth=10, random_state=42, n_jobs=-1)
                     if is_cat else
-                    RandomForestRegressor(n_estimators=150, max_depth=10, random_state=42, n_jobs=-1)
+                    RandomForestRegressor(n_estimators=n_estimators, max_depth=10, random_state=42, n_jobs=-1)
                 )
                 model.fit(X_train, y_train)
                 preds = model.predict(X_pred)

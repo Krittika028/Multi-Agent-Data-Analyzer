@@ -11,8 +11,18 @@ import litellm
 load_dotenv()
 
 # Retry settings
-MAX_RETRIES = 5
-INITIAL_WAIT = 10  # seconds
+# NOTE (perf/reliability fix): the old settings (5 retries, 10s initial wait,
+# doubling to 10/20/40/80s) meant a single struggling call could legitimately
+# take up to ~150s of pure sleep before even giving up — and with several
+# sequential crew tasks (cleaner → analyst → report → summary agents) that
+# compounds into multi-minute requests. On Streamlit Cloud that reads as a
+# hung app ("Received no response from server"), not a clean error. Reduced
+# to a tighter, still-generous budget, and every completion call now carries
+# an explicit request timeout so a hanging connection fails fast instead of
+# blocking forever.
+MAX_RETRIES = 3
+INITIAL_WAIT = 5   # seconds — backoff: 5s → 10s → 20s (~35s total worst case)
+REQUEST_TIMEOUT = 60  # seconds per individual attempt
 
 
 def _llm_completion_with_retry(model, messages, max_tokens=1000, temperature=0.7):
@@ -27,6 +37,7 @@ def _llm_completion_with_retry(model, messages, max_tokens=1000, temperature=0.7
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                timeout=REQUEST_TIMEOUT,
             )
         except Exception as e:
             err = str(e).lower()
@@ -50,7 +61,7 @@ def _build_llm(model_override=None):
         model=model,
         api_key=api_key,
         max_retries=MAX_RETRIES,
-        timeout=120,
+        timeout=REQUEST_TIMEOUT,
     )
 
 

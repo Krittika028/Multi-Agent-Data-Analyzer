@@ -4,6 +4,8 @@ pages/1_Data_Cleaner.py
 
 import streamlit as st
 import pandas as pd
+import time
+import traceback
 from data_cleaner import DataCleaner
 from auth import render_login_page, check_authentication, render_logout
 
@@ -201,24 +203,54 @@ def main():
 
     clean_clicked = st.button("✨ Clean Dataset", type="primary", use_container_width=True)
 
+    if len(raw_df) > 50_000:
+        st.caption(
+            f"⏳ {len(raw_df):,} rows detected — large-dataset optimizations "
+            "(capped LLM calls, sampled model training, bounded row-level parsing) "
+            "are active. This may still take a minute or two."
+        )
+
     if clean_clicked:
         current_df = st.session_state["raw_df"]
-        with st.spinner("Running adaptive cleaning pipeline (profiling → adaptive imputation → ensemble outlier voting)..."):
-            cleaner    = DataCleaner(current_df)
-            cleaned_df, report = cleaner.clean()
+        start_time = time.time()
+        try:
+            with st.spinner(
+                "Running adaptive cleaning pipeline (profiling → adaptive imputation → "
+                "ensemble outlier voting)... large files can take a minute or two."
+            ):
+                cleaner    = DataCleaner(current_df)
+                cleaned_df, report = cleaner.clean()
 
-        st.session_state["cleaned_df"]      = cleaned_df
-        # column_profile / column_classification are now populated for real
-        # (previously an empty dict), so domain_detector.py gets actual
-        # evidence to reason over instead of guessing from raw columns alone.
-        st.session_state["cleaning_report"] = {
-            "log":                   report,
-            "column_profile":        cleaner.get_profile(),
-            "column_classification": cleaner.get_classification(),
-        }
-        st.session_state["cleaning_scorecard"] = cleaner.get_scorecard()
-        st.session_state["near_duplicates"]    = cleaner.get_near_duplicates()
-        st.success("Dataset cleaned successfully.")
+            st.session_state["cleaned_df"]      = cleaned_df
+            # column_profile / column_classification are now populated for real
+            # (previously an empty dict), so domain_detector.py gets actual
+            # evidence to reason over instead of guessing from raw columns alone.
+            st.session_state["cleaning_report"] = {
+                "log":                   report,
+                "column_profile":        cleaner.get_profile(),
+                "column_classification": cleaner.get_classification(),
+            }
+            st.session_state["cleaning_scorecard"] = cleaner.get_scorecard()
+            st.session_state["near_duplicates"]    = cleaner.get_near_duplicates()
+            elapsed = time.time() - start_time
+            st.success(f"Dataset cleaned successfully in {elapsed:.1f}s.")
+        except Exception as e:
+            # A cleaning failure previously had no safety net here — an
+            # uncaught exception mid-pipeline could leave the app in a
+            # broken state with no explanation shown to the user (the
+            # generic Streamlit Cloud "no response from server" screen).
+            # Surface it explicitly instead, and never leave stale/partial
+            # session state behind.
+            for key in ["cleaned_df", "cleaning_report", "cleaning_scorecard", "near_duplicates"]:
+                st.session_state.pop(key, None)
+            st.error(f"❌ Cleaning failed: {e}")
+            with st.expander("Technical details"):
+                st.code(traceback.format_exc())
+            st.info(
+                "This is usually caused by an unusual column format. Try removing "
+                "the flagged column above (in '🗑️ Select Columns to Remove') and "
+                "re-running, or reduce the file size and try again."
+            )
 
     # ── Results ───────────────────────────────────────────────────────────────
     if "cleaned_df" in st.session_state:
