@@ -20,6 +20,7 @@ import plotly.graph_objects as go
 import streamlit as st
 import pandas as pd
 import numpy as np
+import re
 from domain_context import get_domain_config, DEFAULT_LABELS
 # ── Palette ────────────────────────────────────────────────────────────────────
 DARK   = "#0a0a0f"
@@ -40,10 +41,10 @@ ACCENT = [
 # FIRST, so a domain-specific label (e.g. "Diagnosis" for healthcare) wins
 # over a generic fallback when the column doesn't match commerce keywords.
 BUSINESS_CONTEXT = [
-    (["revenue", "sales", "income", "turnover", "gmv"],          "💰", "Revenue",     "$"),
+    (["revenue", "sales", "income", "turnover", "gmv", "spent", "spending", "proceeds"], "💰", "Revenue", "$"),
     (["profit", "margin", "earnings", "ebit", "ebitda", "net"],  "📈", "Profit",       "$"),
-    (["cost", "expense", "spend", "cogs", "opex"],               "💸", "Cost",         "$"),
-    (["price", "rate", "fee", "tariff", "charge", "amount", "spent", "spending"], "🏷️", "Price", "$"),
+    (["cost", "expense", "cogs", "opex"],                        "💸", "Cost",         "$"),
+    (["price", "rate", "fee", "tariff", "charge", "amount"],     "🏷️", "Price",        "$"),
     (["quantity", "qty", "units", "volume", "sold", "orders"],   "📦", "Volume",       ""),
     (["customer", "client", "user", "member", "subscriber"],     "👥", "Customers",    ""),
     (["transaction", "txn", "purchase", "order", "invoice"],     "🧾", "Transactions", ""),
@@ -604,12 +605,40 @@ def render_kpi_cards(df: pd.DataFrame, verified_stats: dict, domain_config: dict
     # ── Revenue-specific detection — deliberately narrower than the general
     # KPI priority list. "Volume"/"Transactions"-type columns rank high for
     # general KPI purposes but are NOT revenue, and showing them under a
-    # "TOTAL REVENUE" label would be a fabricated business claim. ──────────
-    _REVENUE_KEYWORDS = ["revenue", "sales", "gmv", "amount", "price", "earnings", "income", "turnover"]
+    # "TOTAL REVENUE" label would be a fabricated business claim.
+    #
+    # FIX: the previous version matched on a plain substring ("price" in
+    # col_lower), which meant a column like "price_per_unit" — a UNIT price,
+    # not a total — matched before a genuine total-revenue column like
+    # "total_spent" even got a chance (since "spent" wasn't in the keyword
+    # list at all). That's exactly how a $89,307.18 dataset showed a
+    # "$29,500 Total Revenue" card: it silently summed the wrong column.
+    #
+    # Now token-based (split on _/space/-, whole-token match only) so
+    # "price_per_unit" can never match on "price" the way "total_price"
+    # legitimately would, and any column carrying a unit/rate/average token
+    # is excluded outright regardless of what else is in its name. ────────
+    def _tokens(col_name: str) -> set:
+        return set(re.split(r"[_\s\-]+", col_name.lower())) - {""}
+
+    _REVENUE_TOKENS = {
+        "revenue", "sales", "gmv", "earnings", "income", "turnover",
+        "spent", "spend", "fare", "proceeds", "billings", "collections",
+    }
+    _TOTAL_TOKENS = {"total", "grand", "net", "sum", "gross"}
+    _MONEY_TOKENS = {"amount", "price", "cost", "value", "charge", "fee", "paid", "due"}
+    _UNIT_EXCLUDE_TOKENS = {
+        "unit", "per", "avg", "average", "mean", "median", "rate", "ratio",
+    }
 
     def _is_revenue_col(kpi):
-        col_lower = kpi.get("column", "").lower()
-        return any(k in col_lower for k in _REVENUE_KEYWORDS)
+        tokens = _tokens(kpi.get("column", ""))
+        if tokens & _UNIT_EXCLUDE_TOKENS:
+            return False
+        if tokens & _REVENUE_TOKENS:
+            return True
+        # e.g. "total_amount", "total_price", "grand_total", "net_value"
+        return bool((tokens & _TOTAL_TOKENS) and (tokens & _MONEY_TOKENS))
 
     revenue_kpi = next((k for k in kpis if _is_revenue_col(k)), None)
 
@@ -664,7 +693,15 @@ def render_kpi_cards(df: pd.DataFrame, verified_stats: dict, domain_config: dict
 
     # ── 1 — TOTAL REVENUE (guaranteed real, never fabricated) ────────────────
     emoji, label, prefix = _get_business_context(primary_kpi["column"])
-    total = (primary_kpi.get("mean") or 0) * len(df)
+    # FIX: previously recomputed as `mean * len(df)` — fragile and WRONG
+    # whenever len(df) (all rows) doesn't equal the non-null row count the
+    # mean was actually computed over, and redundant besides: stats_engine
+    # already computes an exact `sum` over the real non-null values once,
+    # precisely so every downstream consumer reads that one verified number
+    # instead of re-deriving it (and risking a different, wrong answer).
+    total = primary_kpi.get("sum")
+    if total is None:
+        total = (primary_kpi.get("mean") or 0) * primary_kpi.get("count", len(df))
     card1_label = f"💰 TOTAL REVENUE" if revenue_kpi else f"{emoji} TOTAL {label.upper()}"
     _card(
         cols[0],

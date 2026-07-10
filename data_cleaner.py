@@ -923,9 +923,14 @@ class DataCleaner:
             n_years  = series.dt.year.nunique()
             n_months = series.dt.month.nunique()
 
-            if n_years > 1:
-                self.df[year_col] = self.df[col].dt.year.astype("Int64")
-                split_parts.append(year_col)
+            # Year is always extracted whenever there's a real date column to
+            # split (previously gated behind n_years > 1, which meant a
+            # dataset covering only a single year never got a `_year` column
+            # at all — even though a constant year value is still a valid,
+            # useful field for filters/joins/grouping alongside other years'
+            # data down the line).
+            self.df[year_col] = self.df[col].dt.year.astype("Int64")
+            split_parts.append(year_col)
 
             if n_months > 1 or n_years > 1:
                 import calendar
