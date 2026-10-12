@@ -211,8 +211,12 @@ if uploaded_file:
 
         os.unlink(tmp_path)  # clean up temp file once loaded into memory
     else:
-        df = pl.read_excel(uploaded_file).to_pandas()
-        preview_df = df.head(20)
+        try:
+            df = pl.read_excel(uploaded_file).to_pandas()
+        except Exception as e:
+            st.warning(f"Fast Excel loader failed ({e}); falling back to a slower, tolerant reader.")
+            uploaded_file.seek(0)
+            df = pd.read_excel(uploaded_file, dtype=str)
 
     st.session_state.df_original = df
 
