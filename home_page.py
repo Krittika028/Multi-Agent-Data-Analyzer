@@ -202,7 +202,7 @@ if uploaded_file:
             # inference downstream, where it's already built to happen.
             lf = pl.scan_csv(tmp_path, infer_schema_length=0, ignore_errors=True)
             preview_df = lf.head(20).collect().to_pandas()
-            df = lf.collect(streaming=True).to_pandas()
+            df = lf.collect(engine="streaming").to_pandas()
         except Exception as e:
             st.warning(f"Fast CSV loader failed ({e}); falling back to a slower, tolerant reader.")
             df = pd.read_csv(tmp_path, dtype=str, encoding="utf-8", encoding_errors="replace",
