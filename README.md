@@ -11,7 +11,7 @@ an interactive dashboard, and a chatbot to ask questions about your data. No cod
 
 <img width="1797" height="817" alt="Business_Report" src="https://github.com/user-attachments/assets/f74a3f02-8378-4995-b050-213e3775acb7" />
 
-<img width="1920" height="1020" alt="Smart_Dashboard" src="https://github.com/user-attachments/assets/56535eb1-47e7-4f95-9526-fdb939c13ecd" />
+<img width="1920" height="818" alt="Smart_Dashboard" src="https://github.com/user-attachments/assets/249e2920-a315-47dc-9ebc-94d191186346" />
 
 ## Why this project
 
