@@ -1,11 +1,11 @@
-<img width="1920" height="1020" alt="Screenshot 2026-11-13 003703" src="https://github.com/user-attachments/assets/d635602c-1dbe-43cc-9581-c2b4758abc57" /># Multi-Agent Data Analyzer: Automated Business Intelligence System
+# Multi-Agent Data Analyzer: Automated Business Intelligence System
 
 Upload a raw Excel or CSV file, click one button, and get a cleaned dataset, a business report with strategic recommendations, 
 an interactive dashboard, and a chatbot to ask questions about your data. No coding and no prompt writing required: the whole app is button-driven.
 
 **Live app:** [multi-agent-data-analyzer.streamlit.app](https://multi-agent-data-analyzer.streamlit.app) (works on desktop and mobile)
 
-> Developed during my data science internship.
+> ### Developed during my data science internship period.
 
 <img width="1898" height="892" alt="Data_Preview" src="https://github.com/user-attachments/assets/fb86b887-bd47-432a-b245-030b14c61d7f" />
 
